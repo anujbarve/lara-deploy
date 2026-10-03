@@ -2,6 +2,11 @@
  * Git metadata.
  *
  * Read-only: this CLI never modifies or pushes a repository (SPEC §36).
+ *
+ * These commands run on the *client* through LocalExecutor, so they use argv
+ * rather than POSIX redirection: `2>/dev/null` would be parsed by cmd.exe as a
+ * redirect to a file called `nul`, littering the user's working tree. Git
+ * reports errors on stderr and sets a non-zero exit code, which is discarded.
  */
 
 import type { RemoteExecutor } from '../../providers/exec/types.js';
@@ -36,14 +41,14 @@ export async function readGitInfo(
   const run = (command: string) =>
     executor.exec(command, { cwd, allowFailure: true, timeoutMs: options.timeoutMs ?? 10_000 });
 
-  const inside = await run('git rev-parse --is-inside-work-tree 2>/dev/null');
+  const inside = await run('git rev-parse --is-inside-work-tree');
   if (inside.exitCode !== 0 || inside.stdout.trim() !== 'true') return EMPTY;
 
   const [sha, branch, status, remote] = await Promise.all([
-    run('git rev-parse HEAD 2>/dev/null'),
-    run('git branch --show-current 2>/dev/null'),
-    run('git status --porcelain 2>/dev/null'),
-    run('git remote get-url origin 2>/dev/null'),
+    run('git rev-parse HEAD'),
+    run('git branch --show-current'),
+    run('git status --porcelain'),
+    run('git remote get-url origin'),
   ]);
 
   const shaValue = sha.stdout.trim() || null;

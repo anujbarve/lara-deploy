@@ -230,7 +230,7 @@ export function reportError(error: AppError): void {
     if (typeof stderr === 'string' && stderr.trim() !== '') {
       lines.push('');
       lines.push('Output:');
-      for (const line of stderr.split('\n').slice(-15)) lines.push(`  ${line}`);
+      for (const line of stderr.split(/\r?\n/).slice(-15)) lines.push(`  ${line}`);
     }
   }
   if (error.remediation.length > 0) {

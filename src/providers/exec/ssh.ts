@@ -12,6 +12,7 @@
 import { Client, type ConnectConfig } from 'ssh2';
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { TransportError, RemoteCommandError } from '../../core/errors/errors.js';
 import { redactOutput } from '../../utils/redact.js';
 import { commandLine } from '../../utils/shell.js';
@@ -63,7 +64,7 @@ export class SshExecutor implements RemoteExecutor {
         throw new TransportError(`Unable to read SSH private key at ${keyPath}.`, {
           cause,
           remediation: [
-            `Check the file exists and is readable: ls -l ${keyPath}`,
+            `Check the file exists and is readable at ${keyPath}`,
             'Alternatively configure password authentication in the server profile.',
           ],
         });
@@ -336,12 +337,15 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Expand a leading `~` to the user's home directory.
+ *
+ * Resolves on the *client*, so the result is a native path: `path.join` on
+ * Windows produces a backslash path, which Node's fs accepts, rather than the
+ * hand-rolled `${base}/${rest}` that mangled UNC shares and drive roots.
+ */
 export function expandHome(target: string): string {
   if (target === '~') return os.homedir();
-  if (target.startsWith('~/')) return pathJoin(os.homedir(), target.slice(2));
+  if (target.startsWith('~/') || target.startsWith('~\\')) return path.join(os.homedir(), target.slice(2));
   return target;
-}
-
-function pathJoin(base: string, rest: string): string {
-  return `${base.replace(/\/$/, '')}/${rest}`;
 }

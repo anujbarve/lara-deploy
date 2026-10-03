@@ -54,8 +54,32 @@ git clone <your-fork> laravel-deploy && cd laravel-deploy
 npm install
 npm run build
 npm link          # exposes `laravel-deploy` on your PATH
-npm test          # 244 tests
+npm test
 ```
+
+### Client platform support
+
+The CLI runs on **macOS, Linux and Windows** (PowerShell, cmd.exe and WSL). The
+deployment *target* is always a POSIX server, so only the client side is
+platform-aware.
+
+| | macOS / Linux | Windows |
+| --- | --- | --- |
+| Config directory | `~/.config/laravel-deploy` | `%APPDATA%\laravel-deploy` |
+| Command lookup | `PATH` walk | `PATH` walk + `PATHEXT` (so `.CMD` shims resolve) |
+| Local build shell | `/bin/sh` | `cmd.exe` |
+| File permissions | `chmod 600` on secrets | NTFS ACLs (no POSIX mode bit to set) |
+
+An existing `~/.config/laravel-deploy` on Windows is copied to `%APPDATA%` on
+first run and left in place as a backup. Override the location at any time with
+`LARAVEL_DEPLOY_CONFIG_DIR`.
+
+**Custom build commands are passed to your local shell verbatim.** The generated
+steps (`composer install`, `npm ci`, …) work everywhere, but anything you write
+in `deployment.buildCommands` or `deployment.extraBuildCommands` must use your
+shell's syntax — `&&`, pipes and redirection differ between `sh` and `cmd.exe`.
+Keep them to plain command lines if you want one config to work on every
+platform.
 
 ---
 

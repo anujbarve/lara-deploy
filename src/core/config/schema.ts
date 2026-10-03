@@ -272,7 +272,8 @@ export const appConfigSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
-// Global configuration (~/.config/laravel-deploy)
+// Global configuration (the global config directory: %APPDATA% on Windows,
+// ~/.config elsewhere)
 // ---------------------------------------------------------------------------
 
 export const aapanelConfigSchema = z.object({

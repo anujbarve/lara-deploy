@@ -68,7 +68,10 @@ export class FakeExecutor implements RemoteExecutor {
   }
 
   async which(command: string): Promise<boolean> {
-    return !this.commands.some((c) => c.includes(`command -v ${command}`)) || true;
+    // A real implementation resolves against the OS PATH; the fake has no
+    // filesystem view, so record the query and report the tool as present.
+    this.commands.push(`which ${command}`);
+    return true;
   }
 
   async info(): Promise<ExecutorInfo> {

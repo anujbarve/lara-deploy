@@ -1,12 +1,18 @@
 /**
  * Local process execution (execa).
  *
+ * Commands run through the native command interpreter — cmd.exe on Windows,
+ * /bin/sh on macOS and Linux — so POSIX-only syntax (`2>/dev/null`, `&&` chains,
+ * `command -v`) is not portable and must not be used in commands sent here.
+ * Anything OS-specific is handled in utils/platform.
+ *
  * Used for the build pipeline. Secrets are passed via `env`, never argv.
  */
 
 import { execa, type ResultPromise, type Result } from 'execa';
 import { LocalCommandError } from '../../core/errors/errors.js';
 import { redactOutput } from '../../utils/redact.js';
+import { currentUser, hostname, hasCommand, normalizeOutput, osDescription } from '../../utils/platform.js';
 import {
   DEFAULT_TIMEOUTS,
   displayCommand,
@@ -105,26 +111,35 @@ export class LocalExecutor implements RemoteExecutor {
 
   private toExecResult(result: Result, command: string, started: number): ExecResult {
     return {
-      stdout: String(result.stdout ?? ''),
-      stderr: String(result.stderr ?? ''),
+      // CRLF is collapsed here so every consumer can split on '\n' unconditionally:
+      // local tools emit \r\n on Windows while remote ones never do.
+      stdout: normalizeOutput(String(result.stdout ?? '')),
+      stderr: normalizeOutput(String(result.stderr ?? '')),
       exitCode: typeof result.exitCode === 'number' ? result.exitCode : result.failed ? 1 : 0,
       durationMs: Date.now() - started,
       command,
     };
   }
 
+  /**
+   * Resolve via the OS PATH rather than `command -v`, which does not exist in
+   * cmd.exe or PowerShell. See utils/platform for the Windows PATHEXT handling
+   * that makes `npm`/`pnpm` shims resolve.
+   */
   async which(command: string): Promise<boolean> {
-    const result = await this.exec(`command -v ${command}`, { allowFailure: true });
-    return result.exitCode === 0 && result.stdout.trim() !== '';
+    return hasCommand(command);
   }
 
+  /**
+   * Sourced from `os` rather than shelling out to `hostname` and `uname -sr`,
+   * neither of which exists on a stock Windows install. `process.env.USER` is
+   * also undefined there; Windows sets `USERNAME`.
+   */
   async info(): Promise<ExecutorInfo> {
-    const hostname = (await this.exec('hostname', { allowFailure: true })).stdout.trim();
-    const os = (await this.exec('uname -sr', { allowFailure: true })).stdout.trim();
     return {
-      hostname: hostname || 'localhost',
-      user: process.env.USER ?? 'unknown',
-      os,
+      hostname: hostname() || 'localhost',
+      user: currentUser(),
+      os: osDescription(),
       platform: process.platform,
     };
   }

@@ -23,6 +23,7 @@ import {
 import { ConfigError, ConfigValidationError, type ConfigIssue } from '../errors/errors.js';
 import {
   findProjectRoot,
+  migrateLegacyConfigDir,
   resolvePaths,
   PROJECT_CONFIG_BASENAME,
   type CliPaths,
@@ -179,6 +180,9 @@ export function validateAppConfig(
 
 export function loadGlobalConfig(env: NodeJS.ProcessEnv = process.env): GlobalConfig {
   const paths = resolvePaths(process.cwd(), env);
+  // On Windows the native config directory differs from the historical
+  // ~/.config one; move anything already there before reading.
+  migrateLegacyConfigDir(env);
   if (!fs.existsSync(paths.globalConfigFile)) {
     return globalConfigSchema.parse({ version: 1, servers: {} });
   }
@@ -189,7 +193,7 @@ export function loadGlobalConfig(env: NodeJS.ProcessEnv = process.env): GlobalCo
       throw new ConfigValidationError(
         'Invalid global server configuration.',
         fromZodError(result.error),
-        { remediation: ['Fix ~/.config/laravel-deploy/config.json and retry.'] },
+        { remediation: [`Fix ${paths.globalConfigFile} and retry.`] },
       );
     }
     return result.data;

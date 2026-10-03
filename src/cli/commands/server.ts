@@ -1,14 +1,14 @@
 /**
  * `laravel-deploy server` — manage server profiles.
  *
- * Credentials live in ~/.config/laravel-deploy/config.json and secrets.json;
- * nothing sensitive is ever printed back (SPEC §8).
+ * Credentials live in the global config directory (`%APPDATA%\laravel-deploy`
+ * on Windows, `~/.config/laravel-deploy` elsewhere) as config.json and
+ * secrets.json; nothing sensitive is ever printed back (SPEC §8).
  */
 
 import { Command } from 'commander';
 import { input, select, confirm, password } from '@inquirer/prompts';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import { loadGlobalConfig, saveGlobalConfig } from '../../core/config/loader.js';
@@ -19,6 +19,7 @@ import { emitJson, runCommand, type GlobalOptions } from '../context.js';
 import { TerminalUi } from '../ui/ui.js';
 import { expandHome } from '../../providers/exec/ssh.js';
 import { redactOutput } from '../../utils/redact.js';
+import { IS_WINDOWS, restrictToOwner } from '../../utils/platform.js';
 
 export function registerServerCommand(program: Command): void {
   const server = program.command('server').description('Manage server profiles');
@@ -81,13 +82,12 @@ export function registerServerCommand(program: Command): void {
           );
           if (!fs.existsSync(sshKey)) {
             ui.warn(`Key file not found: ${sshKey}`, 'The profile was saved anyway.');
-          } else {
-            try {
-              fs.chmodSync(sshKey, 0o600);
-              ui.ok('Key permissions normalised', 'chmod 600');
-            } catch {
-              /* best effort */
-            }
+          } else if (restrictToOwner(sshKey)) {
+            ui.ok('Key permissions normalised', 'chmod 600');
+          } else if (IS_WINDOWS) {
+            // NTFS permissions come from ACLs, not a mode bit, so there is
+            // nothing to normalise and OpenSSH will not enforce "owner only".
+            ui.note('On Windows, key permissions come from the file ACL, not chmod.');
           }
         } else if (authMethod === 'password') {
           storedPassword = await password({ message: 'SSH password:' });
@@ -352,7 +352,12 @@ export function registerSecretsCommand(program: Command): void {
         const store = createSecretsStore(path.join(globalConfigDir(), 'secrets.json'));
         const value = flags.value ?? (await password({ message: `Value for ${key}:` }));
         store.set(key, value);
-        process.stdout.write(`Stored ${key}${store.encrypted ? ' (encrypted)' : ' (0600, not encrypted)'}\n`);
+        const protection = store.encrypted
+          ? 'encrypted'
+          : IS_WINDOWS
+            ? 'restricted by file ACL, not encrypted'
+            : '0600, not encrypted';
+        process.stdout.write(`Stored ${key} (${protection})\n`);
         if (!store.encrypted) {
           process.stdout.write(
             'Tip: set LARAVEL_DEPLOY_SECRET_PASSPHRASE to encrypt values at rest.\n',
@@ -408,6 +413,4 @@ export function registerSecretsCommand(program: Command): void {
         return removed ? 0 : 1;
       });
     });
-
-  void os;
 }

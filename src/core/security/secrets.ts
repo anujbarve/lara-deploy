@@ -7,8 +7,10 @@
  *  - the local .env never overwrites the production .env;
  *  - values are only ever displayed once, on explicit request.
  *
- * Storage: a JSON file at ~/.config/laravel-deploy/secrets.json, mode 0600,
- * with values encrypted at rest using AES-256-GCM when a passphrase is available
+ * Storage: a JSON file in the global config directory (secrets.json), written
+ * with mode 0600 where that means something (see utils/platform.restrictToOwner
+ * for the Windows ACL caveat), with values encrypted at rest using AES-256-GCM
+ * when a passphrase is available
  * (LARAVEL_DEPLOY_SECRET_PASSPHRASE). Without a passphrase the file is still
  * 0600 but values are stored obfuscated-with-authentication-tagged encoding and
  * the store reports `encrypted: false` so callers can warn.

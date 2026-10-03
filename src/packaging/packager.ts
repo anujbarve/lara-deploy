@@ -43,6 +43,10 @@ export const DEFAULT_EXCLUDES = [
   'tests',
   'tests/**',
   '.DS_Store',
+  // Windows Explorer / NTFS artefacts, which would otherwise ship in the release.
+  'Thumbs.db',
+  'desktop.ini',
+  'ehthumbs.db',
 ] as const;
 
 /** Always shipped when the strategy needs them. */

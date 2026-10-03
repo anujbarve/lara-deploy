@@ -92,7 +92,8 @@ export function registerLogsCommand(program: Command): void {
 function readLocalLog(logDir: string, lines: number): string {
   const file = path.join(logDir, 'laravel-deploy.log');
   if (!existsSync(file)) return 'No deploy log found yet.\n';
-  const content = readFileSync(file, 'utf8').split('\n');
+  // The log is written on this machine, so on Windows the lines end CRLF.
+  const content = readFileSync(file, 'utf8').split(/\r?\n/);
   return `${content.slice(-lines).join('\n')}\n`;
 }
 
