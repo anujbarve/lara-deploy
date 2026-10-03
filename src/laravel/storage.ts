@@ -20,12 +20,20 @@ export interface StorageLayout {
   requiredDirs: string[];
 }
 
-export function planStorageLayout(siteRoot: string): StorageLayout {
+/**
+ * Plan the storage links for a site.
+ *
+ * `appDir` is the live application directory, which differs per strategy:
+ * `<root>/current` normally, `<root>/main` in legacy-root-copy. Hardcoding
+ * `current` meant a legacy deploy linked storage somewhere the web server never
+ * looked, so uploaded files 404'd.
+ */
+export function planStorageLayout(siteRoot: string, appDir = `${siteRoot}/current`): StorageLayout {
   const shared = `${siteRoot}/shared/storage`;
   return {
     sharedStorage: shared,
-    releaseStorageLink: `${siteRoot}/current/storage`,
-    publicStorageLink: `${siteRoot}/current/public/storage`,
+    releaseStorageLink: `${appDir}/storage`,
+    publicStorageLink: `${appDir}/public/storage`,
     publicStorageTarget: `${shared}/app/public`,
     requiredDirs: [
       `${shared}/app/public`,

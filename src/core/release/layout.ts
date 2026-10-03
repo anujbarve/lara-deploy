@@ -148,7 +148,25 @@ $app->handleRequest(Request::capture());
 /** Directories the legacy strategy copies out of public/. */
 export const LEGACY_PUBLIC_ENTRIES = ['assets', 'build', 'css', 'js', 'images', 'img', 'fonts', 'favicon.ico', 'robots.txt'] as const;
 
-/** Root-level files the legacy strategy must never clobber (SPEC §64). */
+/**
+ * Site-root entries the legacy public copy must never clobber (SPEC §64).
+ *
+ * `.user.ini` and `.well-known` belong to aaPanel and Let's Encrypt;
+ * `.htaccess` belongs to the panel's Apache setups and carries the rewrite
+ * rules the vhost depends on; `index.php` is the bootstrap laravel-deploy
+ * generates, and Laravel's own `public/index.php` must not be copied over it.
+ *
+ * Entries must be plain names. `prepare-release.sh` re-checks this, because the
+ * list comes from a config file that is treated as untrusted input.
+ */
 export function legacyPreservedEntries(configured: readonly string[]): string[] {
-  return [...new Set([...configured, '.user.ini', '.well-known', 'index.php'])];
+  return [
+    ...new Set([
+      '.user.ini',
+      '.htaccess',
+      '.well-known',
+      'index.php',
+      ...configured.filter((entry) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(entry)),
+    ]),
+  ];
 }

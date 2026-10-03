@@ -577,15 +577,76 @@ describe('infrastructure provisioning', () => {
 });
 
 describe('legacy mode', () => {
+  /**
+   * The command that actually runs prepare-release.sh, as opposed to the one
+   * that uploads it. Both contain the script's name, so match on something only
+   * the invocation has.
+   */
+  function prepareInvocation(): string {
+    return remote.commands.find((c) => c.includes('export LD_ARCHIVE=')) as string;
+  }
+  const legacySite = {
+    domain: 'example.com',
+    root: '/www/wwwroot/example.com',
+    documentRootStrategy: 'legacy-root-copy' as const,
+  };
+
   it('uses the legacy main/ layout', async () => {
     const result = await makeOrchestrator({
-      site: { domain: 'example.com', root: '/www/wwwroot/example.com', documentRootStrategy: 'legacy-root-copy' },
+      site: legacySite,
       legacy: { mainDir: 'main' },
     }).deploy(new AutoYes());
 
     expect(result.success).toBe(true);
     expect(remote.saw("export LD_STRATEGY='legacy-root-copy'")).toBe(true);
     expect(remote.saw("export LD_MAIN_DIR='main'")).toBe(true);
+  });
+
+  it('stages the generated bootstrap and tells the script what to publish', async () => {
+    await makeOrchestrator({ site: legacySite, legacy: { mainDir: 'main' } }).deploy(new AutoYes());
+
+    // The document root is the site root, so index.php has to be written there.
+    // It is staged and installed by the script, never written ad hoc.
+    expect(remote.saw('export LD_INDEX_FILE=')).toBe(true);
+    const prepare = prepareInvocation();
+    expect(prepare).toContain('require main/vendor/autoload.php');
+    expect(prepare).toContain('$app->handleRequest');
+
+    // The allowlist and the never-clobber list come from the CLI, not the script.
+    expect(prepare).toContain("export LD_LEGACY_PUBLIC_ENTRIES='assets build css js images img fonts favicon.ico robots.txt'");
+    expect(prepare).toMatch(/export LD_LEGACY_PRESERVE='.*\.user\.ini/s);
+  });
+
+  it('passes operator-configured preserved files through to the script', async () => {
+    await makeOrchestrator({
+      site: legacySite,
+      legacy: { mainDir: 'main', preserveRootFiles: ['custom.conf'] },
+    }).deploy(new AutoYes());
+
+    const prepare = prepareInvocation();
+    expect(prepare).toContain('export LD_LEGACY_PRESERVE=');
+    expect(prepare).toContain('custom.conf');
+  });
+
+  it('links shared storage under the live app dir, not always current/', async () => {
+    await makeOrchestrator({ site: legacySite, legacy: { mainDir: 'main' } }).deploy(new AutoYes());
+
+    // planStorageLayout used to hardcode <root>/current, so a legacy deploy
+    // linked storage somewhere nginx never looks.
+    expect(remote.saw("ln -sfn '/www/wwwroot/example.com/shared/storage/app/public' '/www/wwwroot/example.com/main/public/storage'")).toBe(true);
+    expect(remote.saw('/www/wwwroot/example.com/current/public/storage')).toBe(false);
+  });
+
+  it('verifies the bootstrap is present before activating', async () => {
+    await makeOrchestrator({ site: legacySite, legacy: { mainDir: 'main' } }).deploy(new AutoYes());
+    expect(remote.saw("test -f '/www/wwwroot/example.com/index.php'")).toBe(true);
+  });
+
+  it('publishes nothing in the modern strategy', async () => {
+    await makeOrchestrator().deploy(new AutoYes());
+    // The legacy env vars must not leak into a standard deploy.
+    expect(remote.saw('export LD_INDEX_FILE=')).toBe(false);
+    expect(remote.saw('export LD_LEGACY_PUBLIC_ENTRIES=')).toBe(false);
   });
 });
 

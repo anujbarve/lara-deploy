@@ -91,7 +91,10 @@ RELEASES_DIR="$LD_ROOT/releases"
 SHARED_DIR="$LD_ROOT/shared"
 SHARED_STORAGE="$SHARED_DIR/storage"
 DEPLOY_DIR="$LD_ROOT/.deploy"
-LEGACY_PRESERVE="${LD_LEGACY_PRESERVE:-.user.ini .well-known}"
+LEGACY_PRESERVE="${LD_LEGACY_PRESERVE:-.user.ini .htaccess .well-known index.php}"
+# Space-separated allowlist of what gets copied out of main/public/. Supplied by
+# the CLI (LEGACY_PUBLIC_ENTRIES in src/core/release/layout.ts).
+LD_LEGACY_PUBLIC_ENTRIES="${LD_LEGACY_PUBLIC_ENTRIES:-}"
 
 mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$SHARED_STORAGE" "$DEPLOY_DIR"
 
@@ -175,9 +178,78 @@ if [ "$LD_STRATEGY" != "legacy-root-copy" ]; then
   # and generated files survive every deploy.
   rm -rf "$TARGET/storage"
   ln -s "$SHARED_STORAGE" "$TARGET/storage"
+  # bootstrap/cache must be writable by the web user but is per-release.
+  mkdir -p "$TARGET/bootstrap/cache"
+  echo "==> Release prepared: $TARGET"
+  exit 0
 fi
 
-# bootstrap/cache must be writable by the web user but is per-release.
-mkdir -p "$TARGET/bootstrap/cache"
+# ---------------------------------------------------------------------------
+# Legacy: the document root is LD_ROOT itself
+# ---------------------------------------------------------------------------
+#
+# This mode has no symlink to switch, so nothing about the site root changes
+# until the code below runs. Extracting into main/ on its own leaves the web
+# server pointing at a directory with no index.php — a deploy that reports
+# success and serves a directory listing. So the site root is finished here.
 
-echo "==> Release prepared: $TARGET"
+is_preserved() {
+  for keep in $LD_LEGACY_PRESERVE; do
+    [ "$keep" = "$1" ] && return 0
+  done
+  return 1
+}
+
+echo "==> Publishing public assets to $LD_ROOT"
+
+for entry in $LD_LEGACY_PUBLIC_ENTRIES; do
+  # Plain names only. The list is authored by the CLI, but a stray '/' would
+  # turn a copy step into a write outside the site root, so it is checked here
+  # rather than trusted.
+  if [[ ! "$entry" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "Skipping unusable public entry name: $entry" >&2
+    continue
+  fi
+  # Never touch the panel's files, the generated bootstrap, or anything the
+  # operator asked us to preserve.
+  if is_preserved "$entry"; then
+    continue
+  fi
+  if [ ! -e "$TARGET/public/$entry" ]; then
+    continue
+  fi
+
+  # Replace rather than merge. Vite/Laravel emit content-hashed asset names, so
+  # merging would leave every previous build's files in the document root
+  # forever. Only the allowlisted names are ever removed.
+  rm -rf "${LD_ROOT:?}/$entry"
+  cp -a "$TARGET/public/$entry" "$LD_ROOT/$entry"
+  echo "    published $entry"
+done
+
+# The document root serves /storage directly, so the link has to exist at the
+# site root — main/public/storage is not what nginx resolves for that URL.
+rm -rf "$LD_ROOT/storage"
+ln -s "$SHARED_STORAGE" "$LD_ROOT/storage"
+
+# Install the generated bootstrap last, once main/ is fully in place. Writing it
+# any earlier would point the site at a tree that does not exist yet.
+if [ -n "${LD_INDEX_FILE:-}" ]; then
+  if [ ! -s "$LD_INDEX_FILE" ]; then
+    echo "LD_INDEX_FILE is missing or empty: $LD_INDEX_FILE" >&2
+    exit 10
+  fi
+  cat "$LD_INDEX_FILE" > "$LD_ROOT/index.php"
+  chmod 0644 "$LD_ROOT/index.php"
+  echo "    wrote index.php"
+fi
+
+echo "==> Verifying legacy site root"
+for required in "index.php" "$LD_MAIN_DIR/artisan" "$LD_MAIN_DIR/vendor/autoload.php" "$LD_MAIN_DIR/bootstrap/app.php"; do
+  if [ ! -e "$LD_ROOT/$required" ]; then
+    echo "Legacy release is incomplete: missing $required" >&2
+    exit 11
+  fi
+done
+
+echo "==> Release prepared: $TARGET (document root: $LD_ROOT)"

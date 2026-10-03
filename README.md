@@ -616,7 +616,24 @@ Your existing aaPanel sites may use `domain/main/` with `public/` copied to the 
 { "site": { "domain": "example.com", "documentRootStrategy": "legacy-root-copy" } }
 ```
 
-The CLI then extracts into `main/`, copies public assets, generates an `index.php` that requires `../main/vendor/autoload.php`, and creates the storage symlink — without clobbering `.user.ini`, `.well-known` or other root files.
+The CLI then extracts into `main/`, publishes the built assets to the site root, generates an `index.php` that requires from `main/`, and links shared storage at the document root so `/storage/...` resolves.
+
+The bootstrap is staged first and installed only once `main/` is fully in place, so the site is never pointed at a tree that does not exist yet. `activate-release.sh` then verifies the document root before declaring the release active — a legacy deploy that could not finish fails instead of serving a directory listing.
+
+Published entries are replace-not-merge, so content-hashed assets from previous builds do not accumulate forever.
+
+Four root entries are never clobbered: `.user.ini`, `.htaccess`, `.well-known` (Let's Encrypt lives there) and `index.php` itself. Add your own:
+
+```json
+{
+  "site": { "documentRootStrategy": "legacy-root-copy" },
+  "legacy": { "mainDir": "main", "preserveRootFiles": ["custom.conf"] }
+}
+```
+
+Entries must be plain names, not paths — a name containing `/` is dropped, because a copy step that followed a user-supplied path could write outside the site root.
+
+**Rollback does not work in this mode.** There is no symlink to move and `main/` is overwritten on every deploy, so the previous code is gone by the time a health check runs. If `deployment.rollbackOnHealthFailure` triggers here, the CLI says so and reports the failed release as still live.
 
 The default is the clean model, which is what you want long-term:
 

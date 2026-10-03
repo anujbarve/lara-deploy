@@ -20,7 +20,7 @@ import {
   toAppError,
   UserAbortError,
 } from '../errors/errors.js';
-import { buildLayout, incomingArchivePath, scriptPath, type SiteLayout } from '../release/layout.js';
+import { buildLayout, incomingArchivePath, scriptPath, legacyIndexPhp, legacyPreservedEntries, LEGACY_PUBLIC_ENTRIES, type SiteLayout } from '../release/layout.js';
 import {
   ManifestStore,
   newManifest,
@@ -755,6 +755,25 @@ export class DeploymentOrchestrator {
     const { config, ui } = this.options;
     await this.uploadScript(executor, 'prepare-release.sh');
 
+    // Legacy mode serves the site root itself, so nothing works until a
+    // bootstrap exists there. It is staged here and installed by
+    // prepare-release.sh only after main/ is fully in place, so the site is
+    // never pointed at a tree that does not exist yet.
+    const legacy = this.layout.strategy === 'legacy-root-copy';
+    const indexStage = `${this.layout.deployDir}/staging/${this.releaseId}-index.php`;
+    const indexTag = heredocTag('LDINDEX');
+    const legacyLines = legacy
+      ? [
+          `mkdir -p ${q(`${this.layout.deployDir}/staging`)}`,
+          `cat > ${q(indexStage)} <<'${indexTag}'`,
+          legacyIndexPhp({ mainDir: config.legacy.mainDir }).replace(/\n?$/, ''),
+          indexTag,
+          `export LD_INDEX_FILE=${q(indexStage)}`,
+          `export LD_LEGACY_PRESERVE=${q(legacyPreservedEntries(config.legacy.preserveRootFiles).join(' '))}`,
+          `export LD_LEGACY_PUBLIC_ENTRIES=${q(LEGACY_PUBLIC_ENTRIES.join(' '))}`,
+        ]
+      : [];
+
     const script = [
       'set -Eeuo pipefail',
       `export LD_ROOT=${q(this.layout.root)}`,
@@ -766,6 +785,7 @@ export class DeploymentOrchestrator {
       `export LD_STRATEGY=${q(this.layout.strategy)}`,
       `export LD_MAIN_DIR=${q(config.legacy.mainDir)}`,
       `export LD_PHP=${q(this.phpBinary())}`,
+      ...legacyLines,
       `bash ${q(scriptPath(this.layout, 'prepare-release.sh'))}`,
     ].join('\n');
 
@@ -825,6 +845,14 @@ export class DeploymentOrchestrator {
       const result = await executor.exec(`test -e ${q(`${releaseDir}/${relative}`)}`, { allowFailure: true });
       if (result.exitCode !== 0) missing.push(relative);
     }
+
+    // In legacy mode the document root is the site root, so the generated
+    // bootstrap is what nginx actually executes. main/ can be complete while
+    // the site still 404s, which is exactly what used to happen.
+    if (this.layout.strategy === 'legacy-root-copy') {
+      const index = await executor.exec(`test -f ${q(`${this.layout.root}/index.php`)}`, { allowFailure: true });
+      if (index.exitCode !== 0) missing.push('index.php (document root)');
+    }
     return missing;
   }
 
@@ -839,7 +867,7 @@ export class DeploymentOrchestrator {
     await this.writeRemoteEnv(executor, config);
 
     // storage
-    const storageLayout = planStorageLayout(this.layout.root);
+    const storageLayout = planStorageLayout(this.layout.root, this.layout.appDir);
     const created = await executor.exec(
       [
         'set -Eeuo pipefail',
@@ -1377,13 +1405,14 @@ export class DeploymentOrchestrator {
         remediation: ['Reinstall laravel-deploy: npm install -g laravel-deploy'],
       });
     }
+    const tag = heredocTag('LDSCRIPT');
     await executor.exec(
       [
         'set -Eeuo pipefail',
         `mkdir -p ${q(`${this.layout.deployDir}/scripts`)}`,
-        `cat > ${q(remote)} <<'LDSCRIPT'`,
+        `cat > ${q(remote)} <<'${tag}'`,
         contents.replace(/\n?$/, ''),
-        'LDSCRIPT',
+        tag,
         `chmod 0700 ${q(remote)}`,
       ].join('\n'),
       { label: `upload ${name}` },
@@ -1510,6 +1539,14 @@ function capitalise(value: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A delimiter that cannot appear in the payload, so a heredoc can never be
+ * closed early by its own contents.
+ */
+function heredocTag(prefix: string): string {
+  return `${prefix}${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
 }
 
 void assertRemotePath;

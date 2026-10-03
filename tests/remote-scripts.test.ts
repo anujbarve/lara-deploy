@@ -16,7 +16,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildLayout } from '../src/core/release/layout.js';
+import { buildLayout, legacyIndexPhp, legacyPreservedEntries, LEGACY_PUBLIC_ENTRIES } from '../src/core/release/layout.js';
 
 const SCRIPTS_DIR = path.resolve(__dirname, '..', 'scripts');
 const LAYOUT = buildLayout({ root: '/www/wwwroot/example.com', strategy: 'public' });
@@ -88,6 +88,48 @@ function prepareRelease(
     LD_MAIN_DIR: 'main',
     LD_PHP: 'php',
   });
+}
+
+/**
+ * Run prepare-release.sh in legacy mode, the way the orchestrator does.
+ *
+ * The index.php is staged to a file first and handed to the script by path, so
+ * this mirrors the real wiring rather than a simplified one.
+ */
+function prepareLegacy(
+  releaseId: string,
+  appDir = path.join(sandbox, 'app'),
+  overrides: Record<string, string> = {},
+): { status: number; stdout: string; stderr: string } {
+  const archive = `${root}/.deploy/incoming/${releaseId}.tar.gz`;
+  packRelease(appDir, archive);
+
+  const indexStage = `${root}/.deploy/staging/${releaseId}-index.php`;
+  fs.mkdirSync(path.dirname(indexStage), { recursive: true });
+  fs.writeFileSync(indexStage, legacyIndexPhp({ mainDir: 'main' }));
+
+  return run('prepare-release.sh', {
+    LD_ROOT: root,
+    LD_RELEASE: releaseId,
+    LD_ARCHIVE: archive,
+    LD_FORMAT: 'tar.gz',
+    LD_STRATEGY: 'legacy-root-copy',
+    LD_MAIN_DIR: 'main',
+    LD_PHP: 'php',
+    LD_INDEX_FILE: indexStage,
+    LD_LEGACY_PRESERVE: legacyPreservedEntries([]).join(' '),
+    LD_LEGACY_PUBLIC_ENTRIES: LEGACY_PUBLIC_ENTRIES.join(' '),
+    ...overrides,
+  });
+}
+
+/** Give the fixture some built assets to publish. */
+function addPublicAssets(dir: string): void {
+  fs.mkdirSync(path.join(dir, 'public', 'build', 'assets'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'public', 'build', 'assets', 'app-abc123.js'), 'console.log(1)');
+  fs.mkdirSync(path.join(dir, 'public', 'css'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'public', 'css', 'app.css'), 'body{}');
+  fs.writeFileSync(path.join(dir, 'public', 'robots.txt'), 'User-agent: *\nDisallow:');
 }
 
 function activate(releaseId: string): { status: number; stdout: string; stderr: string } {
@@ -194,6 +236,98 @@ describe('prepare-release.sh', () => {
   });
 });
 
+/**
+ * Legacy mode has no symlink to switch, so the site root itself has to be made
+ * correct. Before this existed, extracting into main/ and stopping was the
+ * whole implementation: the deploy reported success and nginx served the site
+ * root, which had no index.php.
+ */
+describe('prepare-release.sh in legacy-root-copy mode', () => {
+  it('extracts into main/ and writes a bootstrap at the document root', () => {
+    const result = prepareLegacy('20261003-103210');
+    expect(result.status).toBe(0);
+
+    expect(fs.existsSync(path.join(root, 'main', 'artisan'))).toBe(true);
+
+    // The whole point: nginx executes this file, not main/public/index.php.
+    const index = fs.readFileSync(path.join(root, 'index.php'), 'utf8');
+    expect(index).toContain('require main/vendor/autoload.php');
+    expect(index).toContain('require_once main/bootstrap/app.php');
+    expect(index).toContain('$app->handleRequest');
+  });
+
+  it('publishes the built assets to the site root', () => {
+    addPublicAssets(path.join(sandbox, 'app'));
+    const result = prepareLegacy('20261003-103210');
+    expect(result.status).toBe(0);
+
+    expect(fs.existsSync(path.join(root, 'build', 'assets', 'app-abc123.js'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'css', 'app.css'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'robots.txt'))).toBe(true);
+    // The originals are untouched; this is a copy, not a move.
+    expect(fs.existsSync(path.join(root, 'main', 'public', 'css', 'app.css'))).toBe(true);
+  });
+
+  it('never clobbers the files aaPanel and the operator own', () => {
+    addPublicAssets(path.join(sandbox, 'app'));
+    fs.writeFileSync(path.join(sandbox, 'app', 'public', '.htaccess'), 'rewrite from the release');
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+
+    fs.writeFileSync(path.join(root, '.user.ini'), 'open_basedir=/www');
+    fs.writeFileSync(path.join(root, '.htaccess'), 'rewrite from the panel');
+    fs.mkdirSync(path.join(root, '.well-known', 'acme-challenge'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.well-known', 'acme-challenge', 'token'), 'letsencrypt');
+    fs.writeFileSync(path.join(root, 'custom.conf'), 'operator owned');
+
+    expect(prepareLegacy('20261003-103211').status).toBe(0);
+
+    expect(fs.readFileSync(path.join(root, '.user.ini'), 'utf8')).toContain('open_basedir');
+    expect(fs.readFileSync(path.join(root, '.htaccess'), 'utf8')).toBe('rewrite from the panel');
+    expect(fs.readFileSync(path.join(root, '.well-known', 'acme-challenge', 'token'), 'utf8')).toBe('letsencrypt');
+    expect(fs.existsSync(path.join(root, 'custom.conf'))).toBe(true);
+  });
+
+  it('replaces stale assets instead of accumulating old builds', () => {
+    addPublicAssets(path.join(sandbox, 'app'));
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+
+    // A new build with different content-hashed filenames.
+    fs.writeFileSync(path.join(sandbox, 'app', 'public', 'build', 'assets', 'app-def456.js'), 'console.log(2)');
+    fs.rmSync(path.join(sandbox, 'app', 'public', 'build', 'assets', 'app-abc123.js'));
+    expect(prepareLegacy('20261003-103211').status).toBe(0);
+
+    const assets = fs.readdirSync(path.join(root, 'build', 'assets'));
+    expect(assets).toEqual(['app-def456.js']);
+  });
+
+  it('links shared storage where the document root can serve it', () => {
+    // The document root is the site root, so /storage resolves to <root>/storage.
+    // Linking main/public/storage instead leaves uploaded files unreachable.
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+    expect(fs.readlinkSync(path.join(root, 'storage'))).toBe(`${root}/shared/storage`);
+  });
+
+  it('refuses to activate a site root it could not finish', () => {
+    const result = prepareLegacy('20261003-103210', path.join(sandbox, 'app'), {
+      LD_INDEX_FILE: `${root}/.deploy/staging/does-not-exist.php`,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('LD_INDEX_FILE');
+    // Crucially, no half-finished index.php is left behind.
+    expect(fs.existsSync(path.join(root, 'index.php'))).toBe(false);
+  });
+
+  it('is idempotent: re-preparing leaves a working site root', () => {
+    addPublicAssets(path.join(sandbox, 'app'));
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+
+    expect(fs.existsSync(path.join(root, 'index.php'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'css', 'app.css'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'main', 'artisan'))).toBe(true);
+  });
+});
+
 describe('activate-release.sh', () => {
   beforeEach(() => {
     prepareRelease('20261003-103210');
@@ -259,7 +393,25 @@ describe('activate-release.sh', () => {
     expect(result.stderr).toContain('malformed release id');
   });
 
-  it('is a no-op in legacy mode, where there is no symlink', () => {
+  it('verifies the legacy site root instead of trusting the deploy', () => {
+    // Legacy mode used to exit 0 without looking at anything, so a deploy that
+    // produced no document root reported success and served a listing.
+    const result = run('activate-release.sh', {
+      LD_ROOT: root,
+      LD_RELEASE: '20261003-103210',
+      LD_STRATEGY: 'legacy-root-copy',
+      LD_MAIN_DIR: 'main',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Incomplete legacy release');
+    // Still no symlink: this mode never creates one.
+    expect(fs.existsSync(path.join(root, 'current'))).toBe(false);
+  });
+
+  it('activates a prepared legacy release', () => {
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+    fs.writeFileSync(path.join(root, 'shared', '.env'), 'APP_KEY=x\n');
+
     const result = run('activate-release.sh', {
       LD_ROOT: root,
       LD_RELEASE: '20261003-103210',
@@ -267,8 +419,22 @@ describe('activate-release.sh', () => {
       LD_MAIN_DIR: 'main',
     });
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain('Legacy mode');
-    expect(fs.existsSync(path.join(root, 'current'))).toBe(false);
+    expect(result.stdout).toContain('document root');
+  });
+
+  it('refuses a legacy activation when the bootstrap is missing', () => {
+    expect(prepareLegacy('20261003-103210').status).toBe(0);
+    fs.writeFileSync(path.join(root, 'shared', '.env'), 'APP_KEY=x\n');
+    fs.rmSync(path.join(root, 'index.php'));
+
+    const result = run('activate-release.sh', {
+      LD_ROOT: root,
+      LD_RELEASE: '20261003-103210',
+      LD_STRATEGY: 'legacy-root-copy',
+      LD_MAIN_DIR: 'main',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('index.php');
   });
 });
 

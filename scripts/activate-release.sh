@@ -30,9 +30,31 @@ fi
 CURRENT="$LD_ROOT/current"
 
 if [ "$LD_STRATEGY" = "legacy-root-copy" ]; then
-  # Legacy mode has no symlink: the app already lives in main/ and public
-  # assets were copied by prepare-release.sh.
-  echo "==> Legacy mode: no symlink switch required"
+  # Legacy mode has no symlink to switch: the app already lives in main/ and
+  # public assets were copied by prepare-release.sh. There is still something to
+  # verify — the document root is the site root, so a missing bootstrap or a
+  # missing tree means nginx is about to serve a directory listing. Exiting 0
+  # without looking is how that reached production unnoticed.
+  echo "==> Verifying legacy release in $LD_ROOT/$LD_MAIN_DIR"
+  for required in \
+    "index.php" \
+    "$LD_MAIN_DIR/artisan" \
+    "$LD_MAIN_DIR/composer.json" \
+    "$LD_MAIN_DIR/vendor/autoload.php" \
+    "$LD_MAIN_DIR/bootstrap/app.php"
+  do
+    if [ ! -e "$LD_ROOT/$required" ]; then
+      echo "Incomplete legacy release: missing $LD_ROOT/$required" >&2
+      exit 4
+    fi
+  done
+
+  if [ ! -e "$LD_ROOT/shared/.env" ]; then
+    echo "Refusing to activate: $LD_ROOT/shared/.env is missing." >&2
+    exit 5
+  fi
+
+  echo "==> Active release: $LD_MAIN_DIR (document root: $LD_ROOT)"
   exit 0
 fi
 

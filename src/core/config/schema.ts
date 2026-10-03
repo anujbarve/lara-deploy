@@ -246,16 +246,18 @@ export const permissionsConfigSchema = z.object({
 });
 
 export const legacyConfigSchema = z.object({
-  /**
-   * Directory name holding the extracted app in legacy mode.
-   *
-   * legacy-root-copy is only half-implemented: prepare-release.sh installs the
-   * release into this directory, but nothing yet copies public/* to the site
-   * root or rewrites index.php to require from here. Treat it as read-only
-   * until those land, rather than shipping config keys that parse and do
-   * nothing.
-   */
+  /** Directory name holding the extracted app in legacy mode. */
   mainDir: z.string().min(1).default('main'),
+  /**
+   * Extra site-root entries the public copy must never clobber, on top of the
+   * ones laravel-deploy always preserves (`.user.ini`, `.htaccess`,
+   * `.well-known`, `index.php`).
+   *
+   * Entries are plain names, not paths: anything containing a slash is refused
+   * at deploy time, because a copy step that follows a user-supplied path can
+   * write outside the site root.
+   */
+  preserveRootFiles: z.array(z.string()).default([]),
 });
 
 export const appConfigSchema = z.object({
