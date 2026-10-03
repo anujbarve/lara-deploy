@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.laravel-deploy.json
+.laravel-deploy.*.json
+.laravel-deploy.local.json
+deploy-backups/
+*.tar.gz
+*.log
+.DS_Store
+coverage/
