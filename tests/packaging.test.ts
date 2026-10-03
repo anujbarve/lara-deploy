@@ -104,7 +104,7 @@ describe('packager', () => {
     const packager = new Packager({
       projectRoot: root,
       config: { exclude: [], include: [], format: 'tar.gz', level: 1 },
-      tempDir: root,
+      tempDir: fs.mkdtempSync(path.join(os.tmpdir(), 'packout-')),
     });
 
     const result = await packager.create('20261003-101500');
@@ -145,6 +145,32 @@ describe('packager', () => {
     const { execa } = await import('execa');
     const listing = await execa('tar', ['-tzf', second.archivePath]);
     expect(listing.stdout).toContain('artisan');
+  });
+
+  it('never archives the file it is writing, even when tempDir is inside the project', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pack-'));
+    created.push(root);
+    fs.writeFileSync(path.join(root, 'artisan'), 'x');
+    fs.writeFileSync(path.join(root, 'big.bin'), Buffer.alloc(512 * 1024, 7));
+
+    // A nested tempDir guarantees the walker sees the archive file: the mkdir
+    // happens before the walk, and the write stream has opened by the time the
+    // walker descends. Packaging it once was the intermittent "Size mismatch"
+    // flake — the entry grows between tar-stream's stat and its read.
+    const tempDir = path.join(root, 'build-output');
+    const result = await new Packager({
+      projectRoot: root,
+      config: { exclude: [], include: [], format: 'tar.gz', level: 1 },
+      tempDir,
+    }).create('20261003-101500');
+
+    expect(result.fileCount).toBe(2);
+
+    const { execa } = await import('execa');
+    const entries = (await execa('tar', ['-tzf', result.archivePath])).stdout.split('\n');
+    expect(entries.some((e) => e.includes('20261003-101500.tar.gz'))).toBe(false);
+    expect(entries.some((e) => e.includes('artisan'))).toBe(true);
+    expect(entries.some((e) => e.includes('big.bin'))).toBe(true);
   });
 });
 /**

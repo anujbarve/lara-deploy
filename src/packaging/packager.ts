@@ -204,6 +204,10 @@ export class Packager {
 
     const output = fs.createWriteStream(archivePath);
     const archive = createArchive(format, this.options.config.level);
+    // Both halves must be awaited together. Awaiting `finalize()` alone leaves
+    // the pipeline promise dangling, so an archive that fails mid-write
+    // rejects nothing, escapes as an unhandled rejection, and `create()` goes
+    // on to report a truncated release as a success.
     const pipeline = streamPipeline(archive, output);
 
     let fileCount = 0;
@@ -211,6 +215,13 @@ export class Packager {
 
     for await (const relative of walker) {
       const absolute = path.join(this.options.projectRoot, relative);
+      // A tempDir inside the project would otherwise archive the file this
+      // method is writing right now. tar-stream stats each entry up front and
+      // compares that size with the bytes it actually read, so an entry that
+      // grows underneath it aborts the pack with "Size mismatch" — an
+      // intermittent failure that looks like a corrupt-source problem but is
+      // really us reading our own output file.
+      if (path.resolve(absolute) === path.resolve(archivePath)) continue;
       const stat = await fs.promises.lstat(absolute);
 
       if (stat.isSymbolicLink()) {
@@ -228,8 +239,7 @@ export class Packager {
       this.options.onProgress?.(fileCount);
     }
 
-    await archive.finalize();
-    await pipeline;
+    await Promise.all([archive.finalize(), pipeline]);
 
     const stat = await fs.promises.stat(archivePath);
     if (stat.size === 0) {
