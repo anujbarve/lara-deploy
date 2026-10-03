@@ -1,7 +1,18 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { isExcluded, resolveExclusions, Packager, DEFAULT_EXCLUDES } from '../src/packaging/packager.js';
+
+/** Some assertions read the archive back with a real tool; skip when absent. */
+function hasUnzip(): boolean {
+  try {
+    return execFileSync('unzip', ['-v'], { stdio: 'ignore' }) !== undefined || true;
+  } catch {
+    return false;
+  }
+}
 
 const created: string[] = [];
 afterEach(() => {
@@ -134,5 +145,101 @@ describe('packager', () => {
     const { execa } = await import('execa');
     const listing = await execa('tar', ['-tzf', second.archivePath]);
     expect(listing.stdout).toContain('artisan');
+  });
+});
+/**
+ * The archive format must match the bytes on disk.
+ *
+ * `prepare-release.sh` picks tar or unzip from the format the CLI reports, and
+ * the orchestrator names the remote file after it, so a mismatch does not fail
+ * at package time — it fails on the server, after the build and the upload.
+ */
+describe('archive format', () => {
+  function fixture(): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fmt-'));
+    created.push(root);
+    fs.mkdirSync(path.join(root, 'app'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'vendor', 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'artisan'), '#!/usr/bin/env php', { mode: 0o755 });
+    fs.writeFileSync(path.join(root, 'app', 'User.php'), '<?php');
+    fs.writeFileSync(path.join(root, 'vendor', 'bin', 'phpstan'), '#!/usr/bin/env php', { mode: 0o755 });
+    fs.writeFileSync(path.join(root, '.env'), 'SECRET=1');
+    return root;
+  }
+
+  function pack(root: string, format: 'tar.gz' | 'zip') {
+    return new Packager({
+      projectRoot: root,
+      config: { exclude: [], include: [], format, level: 1 },
+      tempDir: fs.mkdtempSync(path.join(os.tmpdir(), 'fmtout-')),
+    }).create('20261003-101500');
+  }
+
+  it('writes real gzip bytes for tar.gz, with a .tar.gz name', async () => {
+    const result = await pack(fixture(), 'tar.gz');
+    expect(result.format).toBe('tar.gz');
+    expect(result.archivePath.endsWith('.tar.gz')).toBe(true);
+
+    const head = fs.readFileSync(result.archivePath).subarray(0, 2);
+    expect([...head]).toEqual([0x1f, 0x8b]);
+  });
+
+  it('writes real zip bytes for zip, with a .zip name', async () => {
+    const result = await pack(fixture(), 'zip');
+    expect(result.format).toBe('zip');
+    expect(result.archivePath.endsWith('.zip')).toBe(true);
+
+    // 'PK\3\4' — the local file header of a real zip, not a renamed tarball.
+    const head = fs.readFileSync(result.archivePath).subarray(0, 4);
+    expect([...head]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+  });
+
+  it.skipIf(!hasUnzip())('produces a zip that unzip can list, with the same entries as tar', async () => {
+    const { execa } = await import('execa');
+
+    const root = fixture();
+    const tar = await pack(root, 'tar.gz');
+    const zip = await pack(root, 'zip');
+
+    const tarEntries = (await execa('tar', ['-tzf', tar.archivePath])).stdout.split('\n').sort();
+    const zipEntries = (await execa('unzip', ['-Z1', zip.archivePath])).stdout.split('\n').sort();
+
+    for (const entry of ['artisan', 'app/User.php', 'vendor/bin/phpstan']) {
+      expect(tarEntries.some((e) => e.replace(/^\.\//, '').endsWith(entry))).toBe(true);
+      expect(zipEntries.some((e) => e.replace(/^\.\//, '').endsWith(entry))).toBe(true);
+    }
+    // The exclusion rules apply identically regardless of format.
+    expect(zipEntries.some((e) => e.endsWith('.env'))).toBe(false);
+  });
+
+  it.skipIf(!hasUnzip())('preserves the executable bit in both formats', async () => {
+    const { execa } = await import('execa');
+    const root = fixture();
+
+    const tar = await pack(root, 'tar.gz');
+    const tarListing = await execa('tar', ['-tzvf', tar.archivePath]);
+    expect(tarListing.stdout).toMatch(/artisan/);
+
+    const zip = await pack(root, 'zip');
+    // zip -Z shows the unix mode; a stripped executable bit breaks vendor/bin.
+    const zipListing = await execa('unzip', ['-Z', zip.archivePath]);
+    const artisanLine = zipListing.stdout.split('\n').find((l) => l.includes('artisan')) as string;
+    expect(artisanLine).toBeDefined();
+    expect(artisanLine).toMatch(/^-rwxr-xr-x|rwxr-xr-x/);
+  });
+
+  it('stores a symlink under its own path, pointing at its target', async () => {
+    const { execa } = await import('execa');
+    const root = fixture();
+    fs.mkdirSync(path.join(root, 'shared'), { recursive: true });
+    fs.symlinkSync('shared', path.join(root, 'linked'));
+
+    const tar = await pack(root, 'tar.gz');
+    const listing = await execa('tar', ['-tzvf', tar.archivePath]);
+    const line = listing.stdout.split('\n').find((l) => l.includes('linked')) as string;
+
+    // Argument order is (entry path, link target). Getting this backwards puts an
+    // entry named after the target, so `linked` would never appear.
+    expect(line).toMatch(/ linked -> shared$/);
   });
 });

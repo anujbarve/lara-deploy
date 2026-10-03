@@ -157,11 +157,31 @@ $ laravel-deploy init
   },
   "queue": { "enabled": true, "workers": 2, "connection": "database" },
   "scheduler": { "enabled": true },
-  "ssl": { "enabled": true, "provider": "letsencrypt" }
+  "ssl": { "enabled": true, "provider": "letsencrypt" },
+  "packaging": { "format": "tar.gz" }
 }
 ```
 
 Comments are allowed. Every section has defaults, so only `server` and `site.domain` are genuinely required.
+
+### Release archive format
+
+`packaging.format` accepts `tar.gz` (default) or `zip`. The archive name, the
+bytes it contains, and the tool the server extracts it with all follow this
+one setting — a mismatch fails on the server after the build and upload, not
+locally.
+
+`zip` requires `unzip` on the server. `prepare-release.sh` checks for it before
+touching anything and tells you how to install it if it is missing:
+
+```bash
+# aaPanel / CentOS
+yum install -y unzip
+# aaPanel / Ubuntu
+apt-get install -y unzip
+```
+
+`tar.gz` has no such dependency and is the safer default.
 
 ### Environment-specific overrides
 

@@ -22,15 +22,23 @@ set -Eeuo pipefail
 : "${LD_RELEASE:?LD_RELEASE is required}"
 LD_REMOVE_RELEASE="${LD_REMOVE_RELEASE:-0}"
 LD_KEEP_ARCHIVE="${LD_KEEP_ARCHIVE:-0}"
+LD_FORMAT="${LD_FORMAT:-tar.gz}"
 
-case "$LD_ROOT" in /*) ;; *) echo "LD_ROOT must be absolute" >&2; exit 2 ;; esac
-case "$LD_RELEASE" in
-  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]|-*[A-Za-z0-9._-]*) ;;
-  *) echo "Refusing to use malformed release id: $LD_RELEASE" >&2; exit 2 ;;
+case "$LD_FORMAT" in
+  tar.gz|zip) ;;
+  *) echo "Unsupported LD_FORMAT: '$LD_FORMAT' (expected tar.gz or zip)" >&2; exit 2 ;;
 esac
 
+case "$LD_ROOT" in /*) ;; *) echo "LD_ROOT must be absolute" >&2; exit 2 ;; esac
+if [[ ! "$LD_RELEASE" =~ ^[0-9]{8}-[0-9]{6}(-[A-Za-z0-9._-]+)?$ ]]; then
+  echo "Refusing to use malformed release id: $LD_RELEASE" >&2
+  exit 2
+fi
+
 DEPLOY_DIR="$LD_ROOT/.deploy"
-INCOMING="$DEPLOY_DIR/incoming/$LD_RELEASE.tar.gz"
+# The uploaded archive keeps the extension of the format it was built in, so
+# a hardcoded .tar.gz would silently leave every zip release on disk.
+INCOMING="$DEPLOY_DIR/incoming/$LD_RELEASE.$LD_FORMAT"
 STAGING="$DEPLOY_DIR/staging/$LD_RELEASE"
 RELEASE_DIR="$LD_ROOT/releases/$LD_RELEASE"
 # Compare unresolved link targets: readlink -f would rewrite /tmp -> /private/tmp

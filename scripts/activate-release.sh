@@ -22,10 +22,10 @@ trap 'echo "activate-release.sh failed at line $LINENO" >&2' ERR
 LD_STRATEGY="${LD_STRATEGY:-public}"
 LD_MAIN_DIR="${LD_MAIN_DIR:-main}"
 
-case "$LD_RELEASE" in
-  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]|-*[A-Za-z0-9._-]*) ;;
-  *) echo "Refusing to use malformed release id: $LD_RELEASE" >&2; exit 2 ;;
-esac
+if [[ ! "$LD_RELEASE" =~ ^[0-9]{8}-[0-9]{6}(-[A-Za-z0-9._-]+)?$ ]]; then
+  echo "Refusing to use malformed release id: $LD_RELEASE" >&2
+  exit 2
+fi
 
 CURRENT="$LD_ROOT/current"
 

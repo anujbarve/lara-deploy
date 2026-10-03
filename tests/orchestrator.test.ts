@@ -395,6 +395,26 @@ describe('plan and dry-run', () => {
   });
 });
 
+describe('packaging format', () => {
+  it('tells the server which archive format to extract', async () => {
+    const result = await makeOrchestrator({ packaging: { format: 'zip' } }).deploy(new AutoYes());
+    expect(result.success).toBe(true);
+
+    // LD_FORMAT selects tar or unzip inside prepare-release.sh. It used to be
+    // omitted entirely, so the script always fell back to tar.gz and a zip
+    // deployment failed on the server after the upload.
+    expect(remote.saw("export LD_FORMAT='zip'")).toBe(true);
+  });
+
+  it('sends tar.gz by default and names the archive to match', async () => {
+    const result = await makeOrchestrator({}).deploy(new AutoYes());
+    expect(result.success).toBe(true);
+
+    expect(remote.saw("export LD_FORMAT='tar.gz'")).toBe(true);
+    expect(remote.saw('.tar.gz')).toBe(true);
+  });
+});
+
 describe('flags', () => {
   it('--skip-build skips the build steps', async () => {
     const result = await makeOrchestrator({}, { skipBuild: true }).deploy(new AutoYes());

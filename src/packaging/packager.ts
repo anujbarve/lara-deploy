@@ -63,13 +63,30 @@ export const DEFAULT_INCLUDES = [
   '.env.example',
 ] as const;
 
+export type ArchiveFormat = 'tar.gz' | 'zip';
+
 export interface PackagingResult {
   archivePath: string;
   bytes: number;
   humanSize: string;
   fileCount: number;
   durationMs: number;
-  format: 'tar.gz' | 'zip';
+  format: ArchiveFormat;
+}
+
+/**
+ * Build the archiver for a format.
+ *
+ * Both plugins support directories and symlinks, and both take each entry's
+ * mode from the source file's stat — which matters, because a release that
+ * loses its executable bit is a release where `artisan` and `vendor/bin/*`
+ * stop working. So the two formats are genuinely interchangeable here and the
+ * walker below does not need to know which one it is feeding.
+ */
+export function createArchive(format: ArchiveFormat, level: number): archiver.Archiver {
+  return format === 'zip'
+    ? archiver('zip', { zlib: { level } })
+    : archiver('tar', { gzip: true, gzipOptions: { level } });
 }
 
 export interface PackagerOptions {
@@ -173,6 +190,8 @@ export class Packager {
   /** Build the archive. */
   async create(releaseId: string): Promise<PackagingResult> {
     const format = this.options.config.format;
+    // The extension must match the bytes: prepare-release.sh selects its
+    // verify/extract tool from LD_FORMAT, and a mismatch fails mid-deploy.
     const tempDir = this.options.tempDir ?? path.join(os.tmpdir(), 'laravel-deploy');
     await fs.promises.mkdir(tempDir, { recursive: true });
     const archivePath = path.join(tempDir, `${releaseId}.${format}`);
@@ -184,7 +203,7 @@ export class Packager {
     const patterns = resolveExclusions(this.options.config);
 
     const output = fs.createWriteStream(archivePath);
-    const archive = archiver('tar', { gzip: true, gzipOptions: { level: this.options.config.level } });
+    const archive = createArchive(format, this.options.config.level);
     const pipeline = streamPipeline(archive, output);
 
     let fileCount = 0;
@@ -196,8 +215,9 @@ export class Packager {
 
       if (stat.isSymbolicLink()) {
         // Ship symlinks as symlinks so shared storage links survive the trip.
+        // Argument order is (entry path, link target) — not the other way round.
         const target = await fs.promises.readlink(absolute);
-        archive.symlink(target, relative);
+        archive.symlink(relative, target);
         fileCount += 1;
       } else if (stat.isDirectory()) {
         archive.directory(relative, relative);

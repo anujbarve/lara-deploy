@@ -745,6 +745,9 @@ export class DeploymentOrchestrator {
       `export LD_ROOT=${q(this.layout.root)}`,
       `export LD_RELEASE=${q(this.releaseId)}`,
       `export LD_ARCHIVE=${q(incomingArchivePath(this.layout, this.releaseId, config.packaging.format))}`,
+      // prepare-release.sh picks tar or unzip from this. Without it the script
+      // silently defaulted to tar.gz and a zip deployment died at extraction.
+      `export LD_FORMAT=${q(config.packaging.format)}`,
       `export LD_STRATEGY=${q(this.layout.strategy)}`,
       `export LD_MAIN_DIR=${q(config.legacy.mainDir)}`,
       `export LD_PHP=${q(this.phpBinary())}`,

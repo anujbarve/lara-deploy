@@ -6,6 +6,7 @@
 #   LD_ROOT=/www/wwwroot/example.com \
 #   LD_RELEASE=20261003-101530-a1b2c3d \
 #   LD_ARCHIVE=/www/wwwroot/example.com/.deploy/incoming/20261003-101530.tar.gz \
+#   LD_FORMAT=tar.gz \
 #   LD_STRATEGY=public \
 #   LD_MAIN_DIR=main \
 #   LD_PHP=php \
@@ -29,15 +30,60 @@ LD_MAIN_DIR="${LD_MAIN_DIR:-main}"
 LD_FORMAT="${LD_FORMAT:-tar.gz}"
 
 # Validate the release id so a malformed value can never escape its directory.
-case "$LD_RELEASE" in
-  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]|-*[A-Za-z0-9._-]*) ;;
-  *) echo "Refusing to use malformed release id: $LD_RELEASE" >&2; exit 2 ;;
-esac
+#
+# The shape is exactly what the CLI produces in buildReleaseId():
+#   YYYYMMDD-HHMMSS              (a deployment with no git SHA)
+#   YYYYMMDD-HHMMSS-<sha7>       (a deployment from a git repository)
+# The optional suffix is what this guard used to reject, which broke every
+# deployment from a git repo.
+#
+# Matched with a regex, not a `case` glob: in a glob `*` also matches '/', so
+# `[A-Za-z0-9._-]*` happily accepted "...-../../etc/evil". Anchored, and the
+# suffix class excludes '/', so the id can never traverse out of releases/.
+if [[ ! "$LD_RELEASE" =~ ^[0-9]{8}-[0-9]{6}(-[A-Za-z0-9._-]+)?$ ]]; then
+  echo "Refusing to use malformed release id: $LD_RELEASE" >&2
+  exit 2
+fi
 
 case "$LD_ROOT" in
   /*) ;;
   *) echo "LD_ROOT must be an absolute path: $LD_ROOT" >&2; exit 2 ;;
 esac
+
+# Only the two formats the CLI can produce. Anything else must fail here rather
+# than reach tar, which would treat a zip as corrupt with a misleading message.
+case "$LD_FORMAT" in
+  tar.gz) ;;
+  zip) ;;
+  *) echo "Unsupported LD_FORMAT: '$LD_FORMAT' (expected tar.gz or zip)" >&2; exit 2 ;;
+esac
+
+# zip needs an unzip binary, which a minimal aaPanel install may not have.
+if [ "$LD_FORMAT" = zip ] && ! command -v unzip >/dev/null 2>&1; then
+  echo "LD_FORMAT=zip requires 'unzip' on the server; it is not installed." >&2
+  echo "Install it (yum install unzip / apt-get install -y unzip), or set packaging.format to tar.gz." >&2
+  exit 8
+fi
+
+# List the archive contents, one entry per line, whatever the format.
+list_archive() {
+  if [ "$LD_FORMAT" = zip ]; then
+    unzip -Z1 "$LD_ARCHIVE"
+  else
+    tar -tzf "$LD_ARCHIVE"
+  fi
+}
+
+# Extract into the directory given as $1.
+extract_archive() {
+  if [ "$LD_FORMAT" = zip ]; then
+    # -o overwrite: re-running replaces the release in place, never fails on a
+    # pre-existing file. unzip restores unix modes and symlinks from the archive.
+    unzip -qq -o "$LD_ARCHIVE" -d "$1"
+  else
+    tar -xzf "$LD_ARCHIVE" -C "$1"
+  fi
+}
 
 umask 022
 
@@ -56,13 +102,13 @@ if [ ! -s "$LD_ARCHIVE" ]; then
 fi
 
 # Confirm the archive is intact before touching anything on disk.
-if ! tar -tzf "$LD_ARCHIVE" >/dev/null 2>&1; then
+if ! list_archive >/dev/null 2>&1; then
   echo "Archive is corrupt: $LD_ARCHIVE" >&2
   exit 4
 fi
 
 # A release must contain artisan; anything else is not a Laravel app.
-if ! tar -tzf "$LD_ARCHIVE" | grep -qE '(^|/)artisan$'; then
+if ! list_archive | grep -qE '(^|/)artisan$'; then
   echo "Archive does not contain artisan; refusing to extract." >&2
   exit 5
 fi
@@ -73,7 +119,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
 echo "==> Extracting"
-tar -xzf "$LD_ARCHIVE" -C "$STAGE"
+extract_archive "$STAGE"
 
 # Archives are created with the project root as the base, so entries may be
 # nested one level deep. Normalise to a flat application directory.

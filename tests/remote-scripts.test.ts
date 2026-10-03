@@ -56,13 +56,34 @@ function packRelease(appDir: string, archivePath: string): void {
   execFileSync('tar', ['-czf', archivePath, '-C', appDir, '.'], { stdio: 'ignore' });
 }
 
-function prepareRelease(releaseId: string, appDir = path.join(sandbox, 'app')): { status: number; stdout: string; stderr: string } {
-  const archive = `${root}/.deploy/incoming/${releaseId}.tar.gz`;
-  packRelease(appDir, archive);
+function hasUnzip(): boolean {
+  try {
+    execFileSync('unzip', ['-v'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function packZip(appDir: string, archivePath: string): void {
+  fs.mkdirSync(path.dirname(archivePath), { recursive: true });
+  execFileSync('zip', ['-qr', archivePath, '.'], { cwd: appDir, stdio: 'ignore' });
+}
+
+/** Build a release archive in the given format and run the real script on it. */
+function prepareRelease(
+  releaseId: string,
+  appDir = path.join(sandbox, 'app'),
+  format: 'tar.gz' | 'zip' = 'tar.gz',
+): { status: number; stdout: string; stderr: string } {
+  const archive = `${root}/.deploy/incoming/${releaseId}.${format}`;
+  if (format === 'zip') packZip(appDir, archive);
+  else packRelease(appDir, archive);
   return run('prepare-release.sh', {
     LD_ROOT: root,
     LD_RELEASE: releaseId,
     LD_ARCHIVE: archive,
+    LD_FORMAT: format,
     LD_STRATEGY: 'public',
     LD_MAIN_DIR: 'main',
     LD_PHP: 'php',
@@ -362,5 +383,208 @@ describe('layout paths match what the scripts expect', () => {
     expect(LAYOUT.lockFile.startsWith(LAYOUT.root)).toBe(true);
     expect(LAYOUT.incomingDir.startsWith(LAYOUT.root)).toBe(true);
     expect(LAYOUT.backupsDir.startsWith(LAYOUT.root)).toBe(true);
+  });
+});
+describe('prepare-release.sh archive formats', () => {
+  it.skipIf(!hasUnzip())('extracts a zip release exactly like a tar.gz one', () => {
+    const result = prepareRelease('20261003-103210', path.join(sandbox, 'app'), 'zip');
+    expect(result.status).toBe(0);
+
+    const release = path.join(root, 'releases', '20261003-103210');
+    expect(fs.existsSync(path.join(release, 'artisan'))).toBe(true);
+    expect(fs.existsSync(path.join(release, 'vendor', 'autoload.php'))).toBe(true);
+    expect(fs.existsSync(path.join(release, 'public', 'index.php'))).toBe(true);
+
+    // The shared-storage symlink is created the same way regardless of format.
+    expect(fs.readlinkSync(path.join(release, 'storage'))).toBe(`${root}/shared/storage`);
+  });
+
+  it.skipIf(!hasUnzip())('creates the shared storage skeleton from a zip', () => {
+    prepareRelease('20261003-103210', path.join(sandbox, 'app'), 'zip');
+    for (const sub of ['app/public', 'framework/views', 'framework/sessions', 'logs']) {
+      expect(fs.existsSync(path.join(root, 'shared', 'storage', sub))).toBe(true);
+    }
+  });
+
+  it.skipIf(!hasUnzip())('refuses a zip that is not a Laravel app', () => {
+    const archive = `${root}/.deploy/incoming/bad.zip`;
+    const empty = path.join(sandbox, 'empty');
+    fs.mkdirSync(empty, { recursive: true });
+    fs.writeFileSync(path.join(empty, 'readme.txt'), 'hello');
+    packZip(empty, archive);
+
+    const result = run('prepare-release.sh', {
+      LD_ROOT: root,
+      LD_RELEASE: '20261003-103210',
+      LD_ARCHIVE: archive,
+      LD_FORMAT: 'zip',
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('artisan');
+  });
+
+  it.skipIf(!hasUnzip())('refuses a corrupt zip rather than extracting it', () => {
+    const archive = `${root}/.deploy/incoming/bad.zip`;
+    fs.mkdirSync(path.dirname(archive), { recursive: true });
+    fs.writeFileSync(archive, 'this is not a zip');
+
+    const result = run('prepare-release.sh', {
+      LD_ROOT: root,
+      LD_RELEASE: '20261003-103210',
+      LD_ARCHIVE: archive,
+      LD_FORMAT: 'zip',
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/corrupt|missing or empty/);
+    expect(fs.existsSync(path.join(root, 'releases', '20261003-103210'))).toBe(false);
+  });
+
+  it('rejects an unknown format before touching the archive', () => {
+    // tar would otherwise report a perfectly good zip as "corrupt", which sends
+    // the operator looking at the upload instead of at their config.
+    const archive = `${root}/.deploy/incoming/x.7z`;
+    fs.mkdirSync(path.dirname(archive), { recursive: true });
+    packRelease(path.join(sandbox, 'app'), archive);
+
+    const result = run('prepare-release.sh', {
+      LD_ROOT: root,
+      LD_RELEASE: '20261003-103210',
+      LD_ARCHIVE: archive,
+      LD_FORMAT: '7z',
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Unsupported LD_FORMAT');
+  });
+
+  it('rejects a tarball announced as a zip instead of extracting it', () => {
+    // Exactly the failure the format plumbing existed to prevent: a valid tar.gz
+    // at a .zip path. tar -tzf would have accepted it; unzip must not.
+    const archive = `${root}/.deploy/incoming/mislabelled.zip`;
+    packRelease(path.join(sandbox, 'app'), archive);
+
+    const result = run('prepare-release.sh', {
+      LD_ROOT: root,
+      LD_RELEASE: '20261003-103210',
+      LD_ARCHIVE: archive,
+      LD_FORMAT: 'zip',
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/corrupt|missing or empty/);
+  });
+});
+
+/**
+ * Release-id validation.
+ *
+ * Every deployment from a git repository produces `<stamp>-<sha7>`, because
+ * buildReleaseId() appends the short SHA. All three release scripts validate
+ * LD_RELEASE against a fixed shape — and that shape omitted the suffix, so every
+ * git deployment was rejected at prepare time, after the build and the upload.
+ *
+ * The existing suite never caught it because every fixture used the no-SHA id.
+ * These cases use the real shape the CLI emits.
+ */
+describe('cleanup.sh archive format', () => {
+  const RID = '20261003-103210';
+
+  it.skipIf(!hasUnzip())('removes a zip archive instead of a non-existent tar.gz', () => {
+    prepareRelease(RID, path.join(sandbox, 'app'), 'zip');
+    const archive = path.join(root, '.deploy', 'incoming', `${RID}.zip`);
+    expect(fs.existsSync(archive)).toBe(true);
+
+    const result = run('cleanup.sh', { LD_ROOT: root, LD_RELEASE: RID, LD_FORMAT: 'zip' });
+    expect(result.status).toBe(0);
+    // Hardcoding .tar.gz here would leave every zip release on disk forever.
+    expect(fs.existsSync(archive)).toBe(false);
+  });
+
+  it('still removes a tar.gz archive by default', () => {
+    prepareRelease(RID, path.join(sandbox, 'app'), 'tar.gz');
+    const archive = path.join(root, '.deploy', 'incoming', `${RID}.tar.gz`);
+    expect(fs.existsSync(archive)).toBe(true);
+
+    const result = run('cleanup.sh', { LD_ROOT: root, LD_RELEASE: RID });
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(archive)).toBe(false);
+  });
+});
+
+describe('release id validation', () => {
+  const GIT_ID = '20261003-103210-a1b2c3d';
+  const PLAIN_ID = '20261003-103210';
+
+  const scripts = ['prepare-release.sh', 'activate-release.sh', 'cleanup.sh'];
+
+  it.each(scripts)('%s accepts the git release id the CLI produces', (script) => {
+    const archive = `${root}/.deploy/incoming/${GIT_ID}.tar.gz`;
+    packRelease(path.join(sandbox, 'app'), archive);
+
+    const result = run(script, {
+      LD_ROOT: root,
+      LD_RELEASE: GIT_ID,
+      LD_ARCHIVE: archive,
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+      LD_PHP: 'php',
+    });
+
+    // A rejection of the id itself is the failure mode being guarded against;
+    // prepare-release legitimately has nothing to activate afterwards.
+    expect(result.stderr).not.toContain('malformed release id');
+    expect(result.status).not.toBe(2);
+  });
+
+  it.each(scripts)('%s still accepts the no-SHA release id', (script) => {
+    const archive = `${root}/.deploy/incoming/${PLAIN_ID}.tar.gz`;
+    packRelease(path.join(sandbox, 'app'), archive);
+
+    const result = run(script, {
+      LD_ROOT: root,
+      LD_RELEASE: PLAIN_ID,
+      LD_ARCHIVE: archive,
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+      LD_PHP: 'php',
+    });
+    expect(result.stderr).not.toContain('malformed release id');
+    expect(result.status).not.toBe(2);
+  });
+
+  it.each(scripts)('%s rejects a traversal id that merely looks git-shaped', (script) => {
+    const archive = `${root}/.deploy/incoming/evil.tar.gz`;
+    packRelease(path.join(sandbox, 'app'), archive);
+
+    const result = run(script, {
+      LD_ROOT: root,
+      // Valid prefix, but the suffix carries a path separator.
+      LD_RELEASE: `${PLAIN_ID}-../../etc/evil`,
+      LD_ARCHIVE: archive,
+      LD_STRATEGY: 'public',
+      LD_MAIN_DIR: 'main',
+      LD_PHP: 'php',
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('malformed release id');
+  });
+
+  it('prepares and then activates a full git-shaped release', () => {
+    // The end-to-end shape of a real deployment from a repository.
+    const prepared = prepareRelease(GIT_ID, path.join(sandbox, 'app'), 'tar.gz');
+    expect(prepared.status).toBe(0);
+    expect(fs.existsSync(path.join(root, 'releases', GIT_ID, 'artisan'))).toBe(true);
+
+    // activate refuses to switch without a server .env, by design.
+    fs.writeFileSync(path.join(root, 'shared', '.env'), 'APP_KEY=x\n');
+    const activated = activate(GIT_ID);
+    expect(activated.status).toBe(0);
+    expect(fs.readlinkSync(path.join(root, 'current')).endsWith(GIT_ID)).toBe(true);
   });
 });
