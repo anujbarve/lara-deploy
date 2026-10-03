@@ -89,6 +89,31 @@ export function assertIdentifier(value: string, label = 'identifier'): string {
 }
 
 /**
+ * Validate a supervisor program name.
+ *
+ * Program names reach the remote shell through `supervisorctl restart <name>`
+ * and become a path under the supervisor config directory, so they must not be
+ * able to carry shell metacharacters (`;` `|` `&` `$` backtick, whitespace) or
+ * `..`. The first character is restricted to a letter or digit so a name can
+ * never be mistaken for a `supervisorctl` flag.
+ *
+ * `assertIdentifier` is not enough: it permits a leading `-`, which would let a
+ * configured name inject an option into supervisorctl.
+ */
+export function assertProgramName(value: string, label = 'supervisor program name'): string {
+  assertNoControlChars(value, label);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
+    throw new SafetyError(`Invalid ${label} "${value}".`, {
+      remediation: [
+        'Use only letters, digits, dot, underscore or dash, starting with a letter or digit.',
+        'This name is passed to supervisorctl on the server, so it cannot contain shell characters.',
+      ],
+    });
+  }
+  return value;
+}
+
+/**
  * Wrap a body so the shell reports failures with context.
  * Prepended to every generated remote script.
  */

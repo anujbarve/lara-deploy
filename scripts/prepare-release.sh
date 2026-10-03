@@ -108,7 +108,14 @@ if ! list_archive >/dev/null 2>&1; then
 fi
 
 # A release must contain artisan; anything else is not a Laravel app.
-if ! list_archive | grep -qE '(^|/)artisan$'; then
+#
+# The listing is captured first and grep reads it from a here-string. Piping the
+# lister straight into `grep -q` is a bug: grep exits on the first match, the
+# lister takes SIGPIPE, and `set -o pipefail` reports the whole pipeline as
+# failed — so a good archive intermittently failed with "does not contain
+# artisan". Capturing removes the upstream process, so there is nothing to kill.
+entries="$(list_archive)"
+if ! grep -qE '(^|/)artisan$' <<<"$entries"; then
   echo "Archive does not contain artisan; refusing to extract." >&2
   exit 5
 fi

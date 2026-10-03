@@ -6,7 +6,7 @@
  * not create (SPEC §25).
  */
 
-import { q } from '../../utils/shell.js';
+import { assertProgramName, q } from '../../utils/shell.js';
 import { RemoteCommandError } from '../../core/errors/errors.js';
 import { SUPERVISOR_MARKER, parseSupervisorStatus, type WorkerPlan } from '../../laravel/workers.js';
 import type { RemoteExecutor } from '../exec/types.js';
@@ -43,7 +43,20 @@ export class SupervisorManager {
 
   /** Path of the program definition for a given name. */
   programFile(name: string): string {
-    return `${this.configDir}/${name}.conf`;
+    // Validated because this becomes a path under /etc/supervisor/conf.d, and
+    // `remove()` passes it to `rm -f`.
+    return `${this.configDir}/${assertProgramName(name)}.conf`;
+  }
+
+  /**
+   * Quote a list of program names for a supervisorctl invocation.
+   *
+   * Names are validated *and* quoted: the validation keeps them from carrying
+   * shell metacharacters at all, and the quoting means a future caller that
+   * skips validation still cannot break out of the command.
+   */
+  private ctlArgs(names: readonly string[]): string {
+    return names.map((name) => assertProgramName(name)).map((name) => q(name)).join(' ');
   }
 
   /**
@@ -136,7 +149,7 @@ export class SupervisorManager {
   /** Restart only the named programs. */
   async restart(names: readonly string[]): Promise<boolean> {
     if (names.length === 0) return false;
-    const result = await this.run(`${this.ctl} restart ${names.join(' ')}`, {
+    const result = await this.run(`${this.ctl} restart ${this.ctlArgs(names)}`, {
       label: 'supervisor restart',
     });
     return result.exitCode === 0;
@@ -145,7 +158,7 @@ export class SupervisorManager {
   /** Stop only the named programs. */
   async stop(names: readonly string[]): Promise<boolean> {
     if (names.length === 0) return false;
-    const result = await this.run(`${this.ctl} stop ${names.join(' ')}`, { allowFailure: true });
+    const result = await this.run(`${this.ctl} stop ${this.ctlArgs(names)}`, { allowFailure: true });
     return result.exitCode === 0;
   }
 

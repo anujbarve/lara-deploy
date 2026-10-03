@@ -38,6 +38,7 @@ interface PutOptions {
   mode?: number;
 }
 import { TransportError } from '../../core/errors/errors.js';
+import { buildHostVerifier } from '../ssh/known-hosts.js';
 import { retry, type RetryOptions } from '../../utils/retry.js';
 import { formatBytes } from '../../utils/ids.js';
 import type { ServerProfile } from '../../core/config/schema.js';
@@ -230,6 +231,21 @@ export class SftpUploader implements Uploader {
       const sock = process.env.SSH_AUTH_SOCK;
       if (sock) connectConfig.agent = sock;
     }
+
+    // This connection carries the release archive, so it must be verified too.
+    // It previously set no hostVerifier at all, meaning it accepted any key
+    // even when the profile asked for strict checking.
+    const verifier = buildHostVerifier(profile);
+    if (verifier) {
+      connectConfig.hostVerifier = verifier;
+    } else {
+      this.logger.warn('SSH host key checking is disabled for this server.', {
+        server: profile.name,
+        host: profile.host,
+      });
+      connectConfig.hostVerifier = () => true;
+    }
+
     await client.connect(connectConfig);
   }
 

@@ -517,6 +517,38 @@ describe('cleanup.sh archive format', () => {
   });
 });
 
+describe('prepare-release.sh archive listing', () => {
+  /**
+   * Regression: `list_archive | grep -q` is a race.
+   *
+   * `grep -q` exits on the first match, the lister takes SIGPIPE, and
+   * `set -o pipefail` turns that into a failed pipeline — so a valid archive
+   * was rejected with "does not contain artisan". It only shows up when the
+   * lister is still writing when grep stops reading, so the archive is built
+   * with many entries to make the race near-certain.
+   */
+  function bulkyApp(dir: string, files: number): void {
+    makeApp(dir);
+    for (let i = 0; i < files; i += 1) {
+      fs.writeFileSync(path.join(dir, 'vendor', `chunk-${String(i).padStart(4, '0')}.php`), '<?php');
+    }
+  }
+
+  const FORMATS: ReadonlyArray<'tar.gz' | 'zip'> = ['tar.gz', 'zip'];
+
+  it.each(FORMATS)('extracts a large %s release reliably', (format) => {
+    if (format === 'zip' && !hasUnzip()) return;
+
+    const app = path.join(sandbox, 'bulky');
+    bulkyApp(app, 400);
+
+    const result = prepareRelease('20261003-103210', app, format);
+    expect(result.stderr).not.toContain('does not contain artisan');
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(path.join(root, 'releases', '20261003-103210', 'artisan'))).toBe(true);
+  });
+});
+
 describe('release id validation', () => {
   const GIT_ID = '20261003-103210-a1b2c3d';
   const PLAIN_ID = '20261003-103210';

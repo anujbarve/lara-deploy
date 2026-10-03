@@ -164,6 +164,12 @@ $ laravel-deploy init
 
 Comments are allowed. Every section has defaults, so only `server` and `site.domain` are genuinely required.
 
+This file is meant to be committed, so it is treated as untrusted input. Values that
+end up in a remote command are validated rather than escaped after the fact — for
+example `queue.processName` must be a plain supervisor program name (letters,
+digits, dot, underscore, dash), because it is passed to `supervisorctl` on the
+server.
+
 ### Release archive format
 
 `packaging.format` accepts `tar.gz` (default) or `zip`. The archive name, the
@@ -208,6 +214,7 @@ Profiles live in `~/.config/laravel-deploy/config.json` (mode `0600`).
       "sshKey": "~/.ssh/id_ed25519",
       "siteRoot": "/www/wwwroot",
       "strictHostKeyChecking": true,
+      "knownHosts": "~/.ssh/known_hosts",
       "aapanel": {
         "enabled": true,
         "url": "https://123.123.123.123:7800",
@@ -221,6 +228,38 @@ Profiles live in `~/.config/laravel-deploy/config.json` (mode `0600`).
 ```
 
 **Prefer SSH keys.** Password auth works but is discouraged. With no API key, the adapter falls back to driving the panel over SSH (`bt` CLI) — provisioning still works, just slower.
+
+### Host key verification
+
+With `strictHostKeyChecking: true` (the default) the server's host key is
+verified against your `known_hosts` file before any command runs, on **both**
+the SSH and SFTP connections. Plain entries, `host,alias` lists, `*.wildcard`
+patterns, hashed entries from `ssh-keygen -H`, and `@revoked` markers are all
+understood.
+
+The CLI does **not** trust a key it has not seen before. Trust a server once:
+
+```bash
+ssh-keyscan -p 22 123.123.123.123 >> ~/.ssh/known_hosts
+```
+
+If the host is missing from the file, the deployment stops before connecting,
+with the `ssh-keyscan` command you need in the error. Verify it first — that is
+the point of the check:
+
+```bash
+ssh-keyscan -p 22 123.123.123.123 | ssh-keygen -lf -
+```
+
+Set `knownHosts` to use a different file, or `strictHostKeyChecking: false` to
+accept any key (this is the only supported way to skip verification, and it
+disables MITM protection for both connections).
+
+> **Behaviour change.** Earlier versions set no `hostVerifier` at all, and ssh2
+> auto-accepts any key in that case — so the default was effectively
+> *unverified* despite the setting. If a deployment starts failing with
+> `cannot be verified`, the server's key is not in your `known_hosts` yet: run
+> the `ssh-keyscan` above rather than disabling the check.
 
 Secrets (SSH passwords, panel API keys, generated DB passwords) go to `~/.config/laravel-deploy/secrets.json`:
 

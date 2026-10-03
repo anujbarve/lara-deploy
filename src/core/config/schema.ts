@@ -119,8 +119,17 @@ export const queueConfigSchema = z.object({
   driver: z.string().default('database'),
   connection: z.string().optional(),
   workers: z.number().int().min(1).max(64).default(1),
-  /** Supervisor program name; derived from the project slug when absent. */
-  processName: z.string().min(1).optional(),
+  /**
+   * Supervisor program name; derived from the project slug when absent.
+   *
+   * Restricted because it is interpolated into a remote `supervisorctl` command
+   * and used to build a path under /etc/supervisor/conf.d. This config file is
+   * meant to be committed, so it is not trusted input (SPEC §58).
+   */
+  processName: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'must be a supervisor program name: letters, digits, dot, underscore or dash, starting with a letter or digit')
+    .optional(),
   /** Extra artisan flags appended to `queue:work`. */
   options: z.array(z.string()).default([]),
   /** Seconds to wait for workers after restart. */

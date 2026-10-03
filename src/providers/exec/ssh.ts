@@ -16,6 +16,7 @@ import path from 'node:path';
 import { TransportError, RemoteCommandError } from '../../core/errors/errors.js';
 import { redactOutput } from '../../utils/redact.js';
 import { commandLine } from '../../utils/shell.js';
+import { buildHostVerifier } from '../ssh/known-hosts.js';
 import { DEFAULT_TIMEOUTS, type ExecOptions, type ExecResult, type ExecutorInfo, type RemoteExecutor } from './types.js';
 import type { ServerProfile } from '../../core/config/schema.js';
 import type { Logger } from '../../utils/logger.js';
@@ -93,7 +94,13 @@ export class SshExecutor implements RemoteExecutor {
       );
     }
 
-    if (!profile.strictHostKeyChecking) {
+    // ssh2 auto-accepts any key when hostVerifier is unset, so this branch is
+    // what makes strictHostKeyChecking mean anything. It also throws for an
+    // unknown host, which is the behaviour SPEC §58 promises.
+    const verifier = buildHostVerifier(profile);
+    if (verifier) {
+      config.hostVerifier = verifier;
+    } else {
       this.logger.warn('SSH host key checking is disabled for this server.', {
         server: profile.name,
         host: profile.host,

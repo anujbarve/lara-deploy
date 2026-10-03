@@ -10,13 +10,15 @@ import {
   envWriteScript,
   DEFAULT_REQUIRED_ENV,
 } from '../src/laravel/env.js';
-import { q, assertHostname, assertRemotePath, assertIdentifier, shellPreamble, heredoc } from '../src/utils/shell.js';
+import { q, assertHostname, assertRemotePath, assertIdentifier, assertProgramName, shellPreamble, heredoc } from '../src/utils/shell.js';
 import { redact, redactOutput, isSensitiveKey } from '../src/utils/redact.js';
 import { DeploymentLock } from '../src/core/release/lock.js';
 import { planPermissions } from '../src/providers/webserver/provider.js';
 import { StorageSecretsStore } from '../src/core/security/storage-store.js';
 import { MemorySecretsStore } from '../src/core/security/secrets.js';
 import { FakeExecutor } from './helpers.js';
+import { SupervisorManager } from '../src/providers/supervisor/manager.js';
+import { validateAppConfig } from '../src/core/config/loader.js';
 import { q as shellQuote } from '../src/utils/shell.js';
 
 const created: string[] = [];
@@ -453,5 +455,81 @@ describe('permission planning', () => {
       chownShared: true,
     });
     expect(plan.steps.join('\n')).toContain(shellQuote("/weird path/release"));
+  });
+});
+/**
+ * Supervisor program names.
+ *
+ * `queue.processName` reaches the server two ways: interpolated into a
+ * `supervisorctl` command, and used to build a path under
+ * /etc/supervisor/conf.d. `.laravel-deploy.json` is read from the repository
+ * being deployed and is designed to be committed, so it is not trusted input —
+ * a name of `evil; rm -rf /` used to split the command and run the rest on the
+ * server as root.
+ */
+describe('supervisor program name safety', () => {
+  it('accepts the names the CLI itself generates', () => {
+    expect(assertProgramName('laravel-my-app-worker')).toBe('laravel-my-app-worker');
+    expect(assertProgramName('laravel-my-app-worker-1')).toBe('laravel-my-app-worker-1');
+    expect(assertProgramName('client_site.worker')).toBe('client_site.worker');
+  });
+
+  it.each([
+    'evil; rm -rf /',
+    'a | tee /etc/passwd',
+    'a && b',
+    'a `id`',
+    'a $(id)',
+    'a\nb',
+    '../escape',
+    'a/../../escape',
+    'has space',
+    'quote\'s',
+    '',
+  ])('rejects %j', (value) => {
+    expect(() => assertProgramName(value)).toThrow();
+  });
+
+  it('rejects a leading dash so a name cannot become a supervisorctl flag', () => {
+    // assertIdentifier permits this; a program name must not.
+    expect(() => assertProgramName('-n')).toThrow();
+    expect(() => assertProgramName('--help')).toThrow();
+  });
+
+  it('quotes names in the supervisorctl command it builds', async () => {
+    const executor = new FakeExecutor();
+    const manager = new SupervisorManager({ executor });
+    await manager.restart(['laravel-app-worker', 'laravel-app-worker-1']);
+
+    const command = executor.commands[0] as string;
+    expect(command).toContain(shellQuote('laravel-app-worker'));
+    expect(command).not.toMatch(/restart [a-z]/);
+  });
+
+  it('refuses to build a program path from an unsafe name', () => {
+    const manager = new SupervisorManager({ executor: new FakeExecutor() });
+    expect(() => manager.programFile('evil; rm -rf /')).toThrow();
+    expect(manager.programFile('laravel-app-worker')).toBe(
+      '/etc/supervisor/conf.d/laravel-app-worker.conf',
+    );
+  });
+
+  it('rejects an unsafe processName at config load, not at deploy time', () => {
+    expect(() =>
+      validateAppConfig({
+        server: 'test',
+        site: { domain: 'example.com' },
+        queue: { processName: 'evil; echo PWNED > /tmp/pwned' },
+      }),
+    ).toThrow();
+  });
+
+  it('still accepts a legitimate processName', () => {
+    const config = validateAppConfig({
+      server: 'test',
+      site: { domain: 'example.com' },
+      queue: { processName: 'client-site-worker' },
+    });
+    expect(config.queue.processName).toBe('client-site-worker');
   });
 });

@@ -323,8 +323,9 @@ describe('supervisor manager', () => {
     });
 
     expect(result.written).toEqual([plan.programName]);
-    // Restart names exactly one program — never a wildcard.
-    expect(executor.saw('supervisorctl restart laravel-client-site-worker')).toBe(true);
+    // Restart names exactly one program — never a wildcard. The name is
+    // quoted so it cannot carry shell metacharacters into supervisorctl.
+    expect(executor.saw(`supervisorctl restart ${q(plan.programName)}`)).toBe(true);
     expect(executor.saw('supervisorctl restart all')).toBe(false);
     expect(executor.saw('supervisorctl restart *')).toBe(false);
   });
