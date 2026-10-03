@@ -175,7 +175,14 @@ function resolveWritable(input: PermissionPlanInput, dir: string): string {
   return `${input.releasePath}/${clean}`;
 }
 
-/** Plan permission changes; never recursive chmod 777 (SPEC §17, §39). */
+/**
+ * Plan permission changes.
+ *
+ * The default is never a recursive chmod 777 (SPEC §17, §39). `chmod777` is the
+ * documented escape hatch for panels whose PHP-FPM user we cannot identify, and
+ * it is deliberately opt-in plus loud: the caller surfaces `warnings` verbatim
+ * so nobody ends up with a world-writable release they did not ask for.
+ */
 export interface PermissionPlanInput {
   releasePath: string;
   sharedPath: string;
@@ -186,6 +193,8 @@ export interface PermissionPlanInput {
   fileMode: string;
   chown: boolean;
   chownShared: boolean;
+  /** Escape hatch: make the whole release world-writable. */
+  chmod777: boolean;
 }
 
 export interface PermissionPlan {
@@ -194,11 +203,14 @@ export interface PermissionPlan {
   writable: string[];
   /** True when the plan is a no-op. */
   empty: boolean;
+  /** Things the operator must be told about before this plan runs. */
+  warnings: string[];
 }
 
 export function planPermissions(input: PermissionPlanInput): PermissionPlan {
   const steps: string[] = [];
   const writable: string[] = [];
+  const warnings: string[] = [];
 
   if (input.chown) {
     // Application code is owned by root and not writable by the web user.
@@ -206,11 +218,25 @@ export function planPermissions(input: PermissionPlanInput): PermissionPlan {
       `chown -R root:${input.webGroup} ${q(input.releasePath)}`,
       `chmod -R ${input.dirMode} ${q(input.releasePath)}`,
     );
-    for (const file of ['artisan', 'composer.json', 'composer.lock', 'package.json']) {
-      steps.push(`[ -f ${q(`${input.releasePath}/${file}`)} ] && chmod ${input.fileMode} ${q(`${input.releasePath}/${file}`)} || true`);
+    if (input.chmod777) {
+      warnings.push(
+        `permissions.chmod777 is on: every file in ${input.releasePath} is being made world-writable. ` +
+          'Any local user, any compromised process and any other PHP application on this box can read ' +
+          'your .env and write your code.',
+      );
+      // chmod -R 0777 in one pass; the dirMode/fileMode sweep below would only
+      // narrow it again.
+      steps.push(`chmod -R 0777 ${q(input.releasePath)}`);
+    } else {
+      for (const file of ['artisan', 'composer.json', 'composer.lock', 'package.json']) {
+        steps.push(`[ -f ${q(`${input.releasePath}/${file}`)} ] && chmod ${input.fileMode} ${q(`${input.releasePath}/${file}`)} || true`);
+      }
+      steps.push(`find ${q(input.releasePath)} -type d -exec chmod ${input.dirMode} {} +`);
+      steps.push(`find ${q(input.releasePath)} -type f -exec chmod ${input.fileMode} {} +`);
     }
-    steps.push(`find ${q(input.releasePath)} -type d -exec chmod ${input.dirMode} {} +`);
-    steps.push(`find ${q(input.releasePath)} -type f -exec chmod ${input.fileMode} {} +`);
+  } else if (input.chmod777) {
+    warnings.push('permissions.chmod777 is on but permissions.chown is off; applying mode changes only.');
+    steps.push(`chmod -R 0777 ${q(input.releasePath)}`);
   }
 
   if (input.chownShared) {
@@ -228,5 +254,5 @@ export function planPermissions(input: PermissionPlanInput): PermissionPlan {
     );
   }
 
-  return { steps, writable, empty: steps.length === 0 };
+  return { steps, writable, empty: steps.length === 0, warnings };
 }

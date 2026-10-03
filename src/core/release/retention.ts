@@ -88,18 +88,26 @@ export async function readCurrentRelease(
   return name && /^[0-9]{8}-[0-9]{6}/.test(name) ? name : null;
 }
 
-/** The release before `current`, i.e. the rollback target. */
+/**
+ * The release deployed before `current`, i.e. the rollback target.
+ *
+ * Release ids are `YYYYMMDD-HHMMSS` stamps, so string order is chronological
+ * order and the rollback target is simply the newest release *older* than the
+ * one that is live. Falling back to the newest release overall only applies
+ * when nothing is live yet.
+ */
 export async function readPreviousRelease(
   executor: RemoteExecutor,
   layout: SiteLayout,
   currentRelease: string | null,
 ): Promise<string | null> {
   const releases = await listReleases(executor, layout);
-  if (!currentRelease) return releases[0] ?? null;
-  const newer = releases
-    .filter((release) => release > currentRelease)
-    .sort((a, b) => (a < b ? 1 : -1));
-  return newer[0] ?? null;
+  // `ls -1` is sorted by the filesystem's collation, not by our stamp, and
+  // activation does not guarantee directory order, so sort explicitly.
+  const sorted = [...releases].sort();
+  if (!currentRelease) return sorted[sorted.length - 1] ?? null;
+  const older = sorted.filter((release) => release < currentRelease);
+  return older[older.length - 1] ?? null;
 }
 
 /** Delete releases and prune database backups, oldest first. */

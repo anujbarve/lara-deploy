@@ -417,6 +417,7 @@ describe('permission planning', () => {
       fileMode: '0644',
       chown: true,
       chownShared: true,
+      chmod777: false,
     });
 
     const script = plan.steps.join('\n');
@@ -437,6 +438,7 @@ describe('permission planning', () => {
       fileMode: '0644',
       chown: true,
       chownShared: true,
+      chmod777: false,
     });
     expect(plan.writable).toContain('/www/wwwroot/example.com/shared/storage');
     expect(plan.steps.join('\n')).toContain('chown -R www:www');
@@ -453,8 +455,30 @@ describe('permission planning', () => {
       fileMode: '0644',
       chown: true,
       chownShared: true,
+      chmod777: false,
     });
     expect(plan.steps.join('\n')).toContain(shellQuote("/weird path/release"));
+  });
+
+  it('applies 0777 and says so, when the chmod777 escape hatch is set', () => {
+    const plan = planPermissions({
+      releasePath: '/r',
+      sharedPath: '/s',
+      webUser: 'www',
+      webGroup: 'www',
+      writableDirs: ['storage'],
+      dirMode: '0755',
+      fileMode: '0644',
+      chown: true,
+      chownShared: true,
+      chmod777: true,
+    });
+
+    expect(plan.steps.join('\n')).toContain('chmod -R 0777');
+    // The mode sweep that would narrow it back to 0755/0644 must not run.
+    expect(plan.steps.join('\n')).not.toContain('find /r');
+    // And the operator is told, rather than discovering it later.
+    expect(plan.warnings.join(' ')).toMatch(/world-writable/);
   });
 });
 /**

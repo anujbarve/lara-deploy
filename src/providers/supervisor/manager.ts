@@ -146,13 +146,40 @@ export class SupervisorManager {
     return { written, updated, unchanged, reread: true, restart };
   }
 
-  /** Restart only the named programs. */
-  async restart(names: readonly string[]): Promise<boolean> {
+  /**
+   * Restart only the named programs.
+   *
+   * `waitSeconds` is what makes `queue.restartTimeoutSeconds` mean something.
+   * `supervisorctl restart` exits 0 the moment it has asked the daemon to stop
+   * and start a program; a worker that dies on boot — bad credentials, a
+   * missing extension, a migration lock — still comes back "successfully" and
+   * the deploy walks away with a silently dead queue. Polling until every named
+   * program is RUNNING is the difference between restarting workers and
+   * checking that they came back.
+   */
+  async restart(names: readonly string[], options: { waitSeconds?: number } = {}): Promise<boolean> {
     if (names.length === 0) return false;
     const result = await this.run(`${this.ctl} restart ${this.ctlArgs(names)}`, {
       label: 'supervisor restart',
     });
-    return result.exitCode === 0;
+    if (result.exitCode !== 0) return false;
+
+    const waitSeconds = options.waitSeconds ?? 0;
+    if (waitSeconds <= 0) return true;
+
+    const deadline = Date.now() + waitSeconds * 1000;
+    // Poll fast enough that a 15s budget is not spent sleeping, slow enough
+    // that we are not asking supervisorctl for status 40 times a second.
+    const intervalMs = Math.min(2_000, Math.max(250, Math.round((waitSeconds * 1000) / 10)));
+    for (;;) {
+      const states = await this.status();
+      if (names.every((name) => states.some((s) => s.name === name && s.state === 'RUNNING'))) {
+        return true;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await sleep(Math.min(intervalMs, remaining));
+    }
   }
 
   /** Stop only the named programs. */
@@ -252,4 +279,8 @@ export class SupervisorManager {
       timeoutMs: options.timeoutMs,
     });
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

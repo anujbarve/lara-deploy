@@ -25,13 +25,18 @@ export class FakeExecutor implements RemoteExecutor {
   /** Every command this executor was asked to run, in order. */
   readonly commands: string[] = [];
 
-  private readonly handlers: Array<{ match: Matcher; response: FakeResponse | (() => FakeResponse) }> = [];
+  private readonly handlers: Array<{
+    match: Matcher;
+    // A response function may take the command, so a test can answer
+    // differently for two invocations of the same matcher.
+    response: FakeResponse | ((command: string) => FakeResponse);
+  }> = [];
 
   /** Default for anything not matched. */
   fallback: FakeResponse = { exitCode: 0, stdout: '' };
 
   /** Answer commands containing `needle`. */
-  on(needle: string | RegExp, response: FakeResponse | (() => FakeResponse)): this {
+  on(needle: string | RegExp, response: FakeResponse | ((command: string) => FakeResponse)): this {
     const match: Matcher =
       typeof needle === 'string'
         ? (command) => command.includes(needle)
@@ -51,7 +56,7 @@ export class FakeExecutor implements RemoteExecutor {
     const handler = [...this.handlers].reverse().find((entry) => entry.match(command));
     const response = handler
       ? typeof handler.response === 'function'
-        ? handler.response()
+        ? handler.response(command)
         : handler.response
       : this.fallback;
     return {

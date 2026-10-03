@@ -407,6 +407,21 @@ export class DeploymentOrchestrator {
         health = await this.checkLive(executor, config);
         if (this.manifest) this.manifest.healthStatus = health.status === 'UNHEALTHY' ? 'failed' : 'healthy';
         this.machine.advance({ to: 'VERIFIED', step: 'verify', at: clock.now() });
+
+        // The candidate check above runs before the symlink switch, so an
+        // UNHEALTHY result there never reaches production. This one does.
+        // `rollbackOnHealthFailure` decides whether we put the previous release
+        // back, not whether a broken deploy is allowed to report success: an
+        // UNHEALTHY live site always fails the deployment.
+        if (health.status === 'UNHEALTHY') {
+          throw config.deployment.rollbackOnHealthFailure
+            ? await this.rollbackAfterHealthFailure(executor, health)
+            : this.unhealthyError('The new release is live but failed its health check.', health, [
+                'The failed release is still live.',
+                'Restore the previous one with `laravel-deploy rollback`.',
+                'Or set deployment.rollbackOnHealthFailure to true to do it automatically.',
+              ]);
+        }
       } else {
         this.machine.skip('verify', 'health check disabled', clock.now(), 'VERIFIED');
       }
@@ -853,7 +868,12 @@ export class DeploymentOrchestrator {
       fileMode: config.permissions.fileMode,
       chown: config.permissions.chown,
       chownShared: config.permissions.chownShared,
+      chmod777: config.permissions.chmod777,
     });
+
+    // A world-writable release is a real security downgrade, so it is never
+    // silent: the plan says so out loud before anything is applied.
+    for (const warning of plan.warnings) ui.warn('Insecure permissions requested', warning);
 
     if (plan.empty) {
       ui.info('Permissions already correct');
@@ -1100,7 +1120,16 @@ export class DeploymentOrchestrator {
 
     const manager = new SupervisorManager({ executor });
     const names = planWorkers(this.project.name, config.queue).map((plan) => plan.programName);
-    await manager.restart(names);
+    const started = await manager.restart(names, {
+      waitSeconds: config.queue.restartTimeoutSeconds,
+    });
+    if (!started) {
+      ui.warn(
+        `Workers did not report RUNNING within ${config.queue.restartTimeoutSeconds}s.`,
+        `Check the worker status on the server, or raise queue.restartTimeoutSeconds (currently ${config.queue.restartTimeoutSeconds}s).`,
+      );
+      return;
+    }
     ui.status('Workers restarted', names.join(', '));
   }
 
@@ -1160,25 +1189,37 @@ export class DeploymentOrchestrator {
 
   private async activateRelease(executor: RemoteExecutor): Promise<void> {
     const { config, ui } = this.options;
+    await this.switchRelease(executor, this.releaseId, 'activate release');
+    ui.ok('Release activated', this.releaseId);
+    ui.info(`Live: https://${config.site.domain}`);
+  }
+
+  /** Point `current` at an already-prepared release using the bundled script. */
+  private async switchRelease(
+    executor: RemoteExecutor,
+    releaseId: string,
+    label: string,
+  ): Promise<void> {
+    const { config } = this.options;
     await this.uploadScript(executor, 'activate-release.sh');
 
     const script = [
       'set -Eeuo pipefail',
       `export LD_ROOT=${q(this.layout.root)}`,
-      `export LD_RELEASE=${q(this.releaseId)}`,
+      `export LD_RELEASE=${q(releaseId)}`,
       `export LD_STRATEGY=${q(this.layout.strategy)}`,
       `export LD_MAIN_DIR=${q(config.legacy.mainDir)}`,
       `bash ${q(scriptPath(this.layout, 'activate-release.sh'))}`,
     ].join('\n');
 
     const result = await executor.exec(script, {
-      label: 'activate release',
+      label,
       timeoutMs: 120_000,
       allowFailure: true,
     });
 
     if (result.exitCode !== 0) {
-      throw new RemoteCommandError('Failed to activate the new release.', result.exitCode, {
+      throw new RemoteCommandError(`Failed to activate release ${releaseId}.`, result.exitCode, {
         command: 'activate-release.sh',
         liveAffected: false,
         details: { stderr: result.stderr.slice(-2000) },
@@ -1188,11 +1229,88 @@ export class DeploymentOrchestrator {
         ],
       });
     }
+  }
 
-    const previous = await readCurrentRelease(executor, this.layout);
-    void previous;
-    ui.ok('Release activated', this.releaseId);
-    ui.info(`Live: https://${config.site.domain}`);
+  /**
+   * Put the previous release back after the live health check failed.
+   *
+   * The returned error is thrown rather than logged: the deployment did break
+   * production, so it must exit non-zero even though the live site has been
+   * restored. Returning the error instead of throwing it from here keeps the
+   * "what to tell the operator" text next to the attempt that failed.
+   */
+  private async rollbackAfterHealthFailure(
+    executor: RemoteExecutor,
+    health: HealthReport,
+  ): Promise<AppError> {
+    const { ui } = this.options;
+    const failures = health.results.filter((r) => r.status === 'fail');
+
+    const current = await readCurrentRelease(executor, this.layout);
+    const previous = await readPreviousRelease(executor, this.layout, current);
+
+    // legacy-root-copy has no symlink to move, so there is nothing to switch
+    // back to — the previous code is gone the moment prepare-release.sh overwrote
+    // main/. Saying so is more useful than attempting a rollback that cannot work.
+    if (this.layout.strategy === 'legacy-root-copy') {
+      ui.warn('Automatic rollback is not supported in legacy-root-copy mode.', 'Deploy an older commit instead.');
+      return this.unhealthyError('The new release is live but failed its health check.', health, [
+        'Rollback is not possible in legacy-root-copy mode: the previous code was overwritten.',
+        'Fix the failure, then re-run `laravel-deploy deploy`.',
+      ]);
+    }
+
+    if (!previous) {
+      ui.warn('No previous release is available to roll back to.', 'This was the first release on the server.');
+      return this.unhealthyError('The new release is live but failed its health check.', health, [
+        'There is no previous release to restore, so the failed release is still live.',
+        'Fix the failure, then re-run `laravel-deploy deploy`.',
+      ]);
+    }
+
+    ui.section('Rollback');
+    try {
+      await this.switchRelease(executor, previous, 'rollback');
+    } catch (error) {
+      const detail = toAppError(error).message;
+      ui.fail('Automatic rollback failed', detail);
+      return this.unhealthyError(
+        'The new release is live, failed its health check, and could not be rolled back.',
+        health,
+        [
+          `Rolling back to ${previous} failed: ${detail}`,
+          `The failed release is STILL LIVE. Roll back by hand: laravel-deploy rollback --to ${previous}`,
+        ],
+      );
+    }
+
+    // The live tree is no longer this deployment, so failure reporting must stop
+    // claiming we changed production.
+    this.activated = false;
+    ui.ok(`Rolled back to ${previous}`);
+    return this.unhealthyError(
+      `The release failed its health check and was rolled back to ${previous}.`,
+      health,
+      [
+        `Live is now ${previous}. The failed release is still on disk for inspection.`,
+        ...failures.flatMap((r) => r.remediation ?? []),
+      ],
+    );
+  }
+
+  /**
+   * The error reported when the live health check fails after activation.
+   * `liveAffected` follows `activated`, so a deploy that already rolled itself
+   * back does not tell the operator production is broken when it is not.
+   */
+  private unhealthyError(message: string, health: HealthReport, remediation: string[]): AppError {
+    return new AppError(message, {
+      liveAffected: this.activated,
+      remediation,
+      details: {
+        checks: health.results.filter((r) => r.status === 'fail').map((r) => `${r.name}: ${r.message}`),
+      },
+    });
   }
 
   private async cleanup(

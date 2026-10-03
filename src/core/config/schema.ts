@@ -237,19 +237,25 @@ export const permissionsConfigSchema = z.object({
   /** Explicit file mode for the release. Default 0755. */
   dirMode: z.string().regex(/^0?\d{3,4}$/).default('0755'),
   fileMode: z.string().regex(/^0?\d{3,4}$/).default('0644'),
-  /** Escape hatch. Default false and loudly warned about. */
+  /**
+   * Escape hatch for panels whose PHP-FPM user we cannot identify: makes the
+   * whole release world-writable. Default false, and loudly warned about when
+   * it is used — this is a real security downgrade, not a preference.
+   */
   chmod777: z.boolean().default(false),
 });
 
 export const legacyConfigSchema = z.object({
-  /** Directory name holding the extracted app in legacy mode. */
+  /**
+   * Directory name holding the extracted app in legacy mode.
+   *
+   * legacy-root-copy is only half-implemented: prepare-release.sh installs the
+   * release into this directory, but nothing yet copies public/* to the site
+   * root or rewrites index.php to require from here. Treat it as read-only
+   * until those land, rather than shipping config keys that parse and do
+   * nothing.
+   */
   mainDir: z.string().min(1).default('main'),
-  /** Copy public/* into the site root. */
-  copyPublic: z.boolean().default(true),
-  /** Rewrite index.php require paths to ../main/. */
-  rewriteIndexPhp: z.boolean().default(true),
-  /** Files at the site root that must never be overwritten. */
-  preserveRootFiles: z.array(z.string()).default(['.user.ini', '.htaccess', '.well-known']),
 });
 
 export const appConfigSchema = z.object({
@@ -323,8 +329,6 @@ export const serverProfileSchema = z.object({
   /** aaPanel site root base, usually /www/wwwroot. */
   siteRoot: remotePath.default('/www/wwwroot'),
   aapanel: aapanelConfigSchema.default({}),
-  /** Extra SSH options string. */
-  sshOptions: z.string().optional(),
   notes: z.string().optional(),
 });
 

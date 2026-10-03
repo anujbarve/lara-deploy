@@ -342,6 +342,80 @@ describe('activation failure', () => {
   });
 });
 
+describe('post-activation health failure', () => {
+  /**
+   * A server that is healthy inside the staged release but broken once the
+   * symlink points at it. The two health checks differ only by their working
+   * directory: the candidate check runs inside `releases/<id>`, the live check
+   * inside `current`. `healthCheck.http` and `.ssl` are off because they would
+   * reach the real network; laravel, database and storage are remote commands.
+   */
+  function breaksAfterActivation(): FakeExecutor {
+    // The server's release history. Needed so there is something to roll back
+    // to: the real `ls` path is quoted, so the happy-path matcher (which uses
+    // the bare path) never fires and the listing would otherwise be empty.
+    remote.on('ls -1', { stdout: '20261003-101500\n20261002-101500' });
+    // The storage probe is a single command printing key=value lines.
+    remote.on('SHARED=', {
+      stdout: 'SHARED=ok\nLINK=/www/wwwroot/example.com/shared/storage\nWRITABLE=yes',
+    });
+    remote.on('artisan about', (command) =>
+      command.includes("/current'")
+        ? { exitCode: 1, stderr: 'Fatal error: Allowed memory size exhausted' }
+        : { exitCode: 0, stdout: 'Environment  production' },
+    );
+    return remote;
+  }
+
+  const healthConfig = {
+    deployment: { activationSettleSeconds: 0, rollbackOnHealthFailure: true },
+    healthCheck: { enabled: true, http: false, ssl: false },
+  };
+
+  it('rolls back to the previous release and still fails the deployment', async () => {
+    breaksAfterActivation();
+    const result = await makeOrchestrator(healthConfig).deploy(new AutoYes());
+
+    // Failing, even though the live site is healthy again: this deployment is
+    // what broke it, and a CI pipeline must not read it as a green build.
+    expect(result.success).toBe(false);
+    expect(result.failure?.message).toMatch(/rolled back to 20261002-101500/);
+
+    // It really switched: the last activation targets the *older* release.
+    const activations = remote.commands.filter((c) => c.includes('export LD_RELEASE='));
+    expect(activations[activations.length - 1]).toContain("export LD_RELEASE='20261002-101500'");
+
+    // Production is back on the old code, so the report must not claim otherwise.
+    expect(result.failure?.liveAffected).toBe(false);
+    expect(result.manifest.healthStatus).toBe('failed');
+  });
+
+  it('leaves the failed release live when rollbackOnHealthFailure is off', async () => {
+    breaksAfterActivation();
+    const result = await makeOrchestrator({
+      ...healthConfig,
+      deployment: { activationSettleSeconds: 0, rollbackOnHealthFailure: false },
+    }).deploy(new AutoYes());
+
+    expect(result.success).toBe(false);
+    expect(result.failure?.liveAffected).toBe(true);
+    expect(result.failure?.remediation.join(' ')).toMatch(/laravel-deploy rollback/);
+
+    const activations = remote.commands.filter((c) => c.includes('export LD_RELEASE='));
+    expect(activations[activations.length - 1]).toContain("export LD_RELEASE='20261003-103210'");
+  });
+
+  it('does not activate a release that already failed the candidate check', async () => {
+    breaksAfterActivation();
+    remote.on('artisan about', { exitCode: 1, stderr: 'boom' });
+    const result = await makeOrchestrator(healthConfig).deploy(new AutoYes());
+
+    expect(result.success).toBe(false);
+    expect(result.failure?.liveAffected).toBe(false);
+    expect(result.failure?.message).toMatch(/not activated/);
+  });
+});
+
 describe('simultaneous deployments', () => {
   it('refuses the second deploy while a lock is held', async () => {
     remote.on(".deploy/deployment.lock' 2>/dev/null", {

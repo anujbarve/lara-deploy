@@ -288,6 +288,39 @@ describe('supervisor manager', () => {
     expect(contents).not.toContain('777');
   });
 
+  it('reports a restart that leaves the workers dead', async () => {
+    // `supervisorctl restart` exits 0 as soon as it has asked the daemon to
+    // restart. Waiting for RUNNING is what turns that into a real check — and
+    // queue.restartTimeoutSeconds is the budget it gets.
+    const executor = new FakeExecutor().on('supervisorctl status', {
+      stdout: 'laravel-client-site-worker  FATAL  Exited too quickly  0:00:00',
+    });
+    const manager = new SupervisorManager({ executor });
+
+    expect(await manager.restart(['laravel-client-site-worker'])).toBe(true);
+    expect(
+      await manager.restart(['laravel-client-site-worker'], { waitSeconds: 1 }),
+    ).toBe(false);
+    // It really looked, rather than trusting the restart's exit code.
+    expect(executor.commands.filter((c) => c.includes('supervisorctl status')).length).toBeGreaterThan(1);
+  });
+
+  it('reports a restart once every worker is RUNNING', async () => {
+    const executor = new FakeExecutor().on('supervisorctl status', {
+      stdout: [
+        'laravel-client-site-worker    RUNNING   pid 1234, uptime 0:00:01',
+        'laravel-client-site-worker-1  RUNNING   pid 1235, uptime 0:00:01',
+      ].join('\n'),
+    });
+
+    expect(
+      await new SupervisorManager({ executor }).restart(
+        ['laravel-client-site-worker', 'laravel-client-site-worker-1'],
+        { waitSeconds: 15 },
+      ),
+    ).toBe(true);
+  });
+
   it('does not restart an unchanged program', async () => {
     const plan = planWorkers('client-site', queueConfig)[0]!;
     const contents = new SupervisorManager({ executor: new FakeExecutor() }).renderProgram({

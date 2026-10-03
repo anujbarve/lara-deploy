@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { buildReleaseId, buildDeploymentId, releaseStamp, formatBytes, formatDuration, generatePassword } from '../src/utils/ids.js';
 import { buildLayout, legacyIndexPhp, releasePath, incomingArchivePath } from '../src/core/release/layout.js';
-import { planRetention } from '../src/core/release/retention.js';
+import { planRetention, readPreviousRelease } from '../src/core/release/retention.js';
 import { legacyPreservedEntries, LEGACY_PUBLIC_ENTRIES } from '../src/core/release/layout.js';
+import { FakeExecutor } from './helpers.js';
 
 describe('release naming', () => {
   it('formats a UTC release stamp as YYYYMMDD-HHMMSS', () => {
@@ -170,5 +171,36 @@ describe('release retention', () => {
   it('always keeps at least one release', () => {
     const plan = planRetention({ releases, currentRelease: null, keepReleases: 0 });
     expect(plan.keep.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('rollback target', () => {
+  const layout = buildLayout({ root: '/www/wwwroot/example.com', strategy: 'public' });
+
+  function server(entries: string[]) {
+    // `listReleases` filters the listing through the release-id regex.
+    return new FakeExecutor().on('ls -1', { stdout: entries.join('\n') });
+  }
+
+  it('picks the release deployed before the current one', async () => {
+    const executor = server(['20261003-101500', '20261003-102500', '20261003-103500']);
+    expect(await readPreviousRelease(executor, layout, '20261003-103500')).toBe('20261003-102500');
+  });
+
+  it('never picks a release newer than the current one', async () => {
+    // Forward deploys are normal, so newer releases are sitting right there on
+    // the server. Returning one of those would "roll back" into the future.
+    const executor = server(['20261003-101500', '20261003-103500']);
+    expect(await readPreviousRelease(executor, layout, '20261003-101500')).toBeNull();
+  });
+
+  it('does not depend on the order the filesystem listed the releases in', async () => {
+    const executor = server(['20261003-102500', '20261003-101500', '20261003-103500']);
+    expect(await readPreviousRelease(executor, layout, '20261003-103500')).toBe('20261003-102500');
+  });
+
+  it('falls back to the newest release when nothing is live yet', async () => {
+    const executor = server(['20261003-101500', '20261003-103500']);
+    expect(await readPreviousRelease(executor, layout, null)).toBe('20261003-103500');
   });
 });

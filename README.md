@@ -189,6 +189,33 @@ apt-get install -y unzip
 
 `tar.gz` has no such dependency and is the safer default.
 
+### When a deploy breaks production
+
+Two settings decide what happens after a release goes live.
+
+`deployment.rollbackOnHealthFailure` (default `true`). After the symlink switch
+and the settle delay, the live site is health-checked. If it comes back
+`UNHEALTHY`, the previous release is activated again — and the deployment still
+exits non-zero, because this deployment is what broke it and a CI pipeline must
+not read it as a green build. Set it to `false` to leave the failed release in
+place and be told to run `laravel-deploy rollback` by hand.
+
+A rollback needs a previous release to go back to. On a first deploy, or in
+`legacy-root-copy` mode (which has no symlink to move), the CLI says so and
+reports the failed release as still live.
+
+`queue.restartTimeoutSeconds` (default `15`). `supervisorctl restart` exits 0 as
+soon as it has *asked* for a restart — a worker that dies on boot still counts as
+a success. The deploy polls until every program reports `RUNNING` and warns if
+they do not, so a silently dead queue is caught at deploy time rather than by a
+missing job.
+
+`permissions.chmod777` (default `false`) is an escape hatch for panels whose
+PHP-FPM user cannot be detected. It makes the whole release world-writable, which
+lets any local user and any other PHP application on the box read your `.env`
+and write your code. It is never silent: the deploy prints the warning before
+applying anything.
+
 ### Environment-specific overrides
 
 ```bash

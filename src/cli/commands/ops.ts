@@ -602,7 +602,14 @@ export function registerPermissionsCommand(program: Command): void {
             fileMode: ctx.config.permissions.fileMode,
             chown: ctx.config.permissions.chown,
             chownShared: ctx.config.permissions.chownShared,
+            chmod777: ctx.config.permissions.chmod777,
           });
+
+          // Same rule as the deploy path: a world-writable release is never
+          // applied without saying so first.
+          for (const warning of plan.warnings) {
+            ctx.ui.warn('Insecure permissions requested', warning);
+          }
 
           ctx.ui.section('Permissions');
           ctx.ui.info(`Web user: ${webInfo.webUser}:${webInfo.webGroup}`);
