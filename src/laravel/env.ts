@@ -112,7 +112,7 @@ export function planEnvWrite(input: {
   /** First deployment to this site. */
   isFirstDeploy: boolean;
   domain: string;
-  database: { name: string; username: string; password: string; host: string; port: number };
+  database: { name: string; username: string; password: string; host: string; port: number; driver: string };
   appKey?: string;
   templateContents?: string;
   uploadContents?: string;
@@ -125,7 +125,48 @@ export function planEnvWrite(input: {
 
   if (input.strategy === 'preserve') {
     if (existing && Object.keys(existing).length > 0) {
-      return { contents: null, reason: 'Server .env preserved (envStrategy=preserve).', changedKeys: [] };
+      // `preserve` means the server .env is the operator's, not ours — with
+      // narrow exceptions for values the app cannot run correctly without, and
+      // which the deploy itself is responsible for. Everything else is left
+      // exactly as it is, including any existing APP_KEY.
+      const repaired = { ...existing };
+      const reasons: string[] = [];
+
+      // DB_CONNECTION names the driver the app will actually use. When it
+      // contradicts the driver this deploy provisioned, honouring it means
+      // `artisan migrate` silently targets a different database than the one
+      // the deploy just created and backed up. There is no second database for
+      // that value to legitimately point at, so the drift is corrected.
+      const deployedDriver = existing.DB_CONNECTION;
+      if (deployedDriver !== undefined && deployedDriver !== '' && deployedDriver !== input.database.driver) {
+        repaired.DB_CONNECTION = input.database.driver;
+        reasons.push(
+          `DB_CONNECTION was "${deployedDriver}" but the deploy provisioned a ` +
+            `"${input.database.driver}" database — leaving it would migrate a different database`,
+        );
+      }
+
+      // APP_KEY is in DEFAULT_REQUIRED_ENV: without it the app throws "No
+      // application encryption key has been specified" on every request. It can
+      // only be absent here if an earlier deploy created the file from
+      // .env.example, where the line ships empty. Generating one is safe —
+      // there is no existing key to clobber, so nothing can have been encrypted
+      // under it — and an existing key is never replaced.
+      if (repaired.APP_KEY === undefined || repaired.APP_KEY === '') {
+        repaired.APP_KEY = input.appKey ?? generateValue('APP_KEY') ?? '';
+        if (repaired.APP_KEY !== '') {
+          reasons.push('APP_KEY was missing and has been generated — the app cannot boot without it');
+        }
+      }
+
+      if (reasons.length === 0) {
+        return { contents: null, reason: 'Server .env preserved (envStrategy=preserve).', changedKeys: [] };
+      }
+      return {
+        contents: renderEnv(repaired),
+        reason: `Server .env preserved except: ${reasons.join('; ')}.`,
+        changedKeys: diffKeys(existing, repaired),
+      };
     }
     if (!input.isFirstDeploy) {
       return { contents: null, reason: 'Server .env preserved (envStrategy=preserve).', changedKeys: [] };
@@ -202,13 +243,13 @@ function baseEnv(
   const merged: Record<string, string> = { ...source };
   for (const [key, value] of Object.entries(input.extraValues)) merged[key] = value;
   merged.APP_URL = merged.APP_URL || `https://${input.domain}`;
-  merged.DB_CONNECTION = merged.DB_CONNECTION || 'mysql';
-  merged.DB_HOST = merged.DB_HOST || input.database.host;
-  merged.DB_PORT = merged.DB_PORT || String(input.database.port);
-  merged.DB_DATABASE = merged.DB_DATABASE || input.database.name;
-  merged.DB_USERNAME = merged.DB_USERNAME || input.database.username;
   if (!merged.DB_PASSWORD) merged.DB_PASSWORD = input.database.password;
-  if (!merged.APP_KEY) merged.APP_KEY = input.appKey ?? '';
+  // APP_KEY ships empty in .env.example, and the orchestrator does not pass one
+  // in, so a first deploy used to write an .env with no encryption key at all —
+  // `artisan migrate` then failed with "No application encryption key has been
+  // specified". It is generated once here and then preserved like any other
+  // value, so it stays stable across deploys and existing sessions keep working.
+  if (!merged.APP_KEY) merged.APP_KEY = input.appKey ?? generateValue('APP_KEY') ?? '';
 
   // These are production invariants, not preferences. A .env.example copied in
   // from development must never carry APP_ENV=local or APP_DEBUG=true to a live
@@ -225,6 +266,29 @@ function baseEnv(
   for (const [key, value] of Object.entries(existing)) {
     if (value !== undefined && value !== '') merged[key] = value;
   }
+  // The database identity is a deployment invariant, not a preference, and is
+  // forced after the merge so nothing can override it.
+  //
+  // A .env.example that says DB_CONNECTION=sqlite (the Laravel default) used to
+  // win, because the old code defaulted it with `||`: the deploy provisioned
+  // MySQL, wrote MySQL credentials, and then `artisan migrate` silently ran
+  // against sqlite instead — migrations landed in the release directory while
+  // the real database stayed empty. The same applied to an existing server
+  // .env, which the "existing values win" loop above preserved forever.
+  //
+  // Host/port/name/username are forced for the same reason: they name the
+  // database this deploy actually provisioned, so a development value copied in
+  // from .env.example points the app at a database that does not exist. An
+  // operator who has deliberately set one on the server is still honoured —
+  // that value is in `existing` and the loop above keeps it.
+  //
+  // DB_PASSWORD is deliberately NOT forced: it is a secret that is rotated
+  // independently, and clobbering a working one would lock the app out.
+  merged.DB_CONNECTION = input.database.driver;
+  merged.DB_HOST = input.database.host;
+  merged.DB_PORT = String(input.database.port);
+  merged.DB_DATABASE = input.database.name;
+  merged.DB_USERNAME = input.database.username;
   return merged;
 }
 
@@ -240,6 +304,9 @@ function applyDefaults(
   for (const [key, value] of Object.entries(working)) {
     merged[key] = value;
   }
+  // Forced again here: `working` is layered on top of the defaults and would
+  // otherwise reintroduce a DB_CONNECTION inherited from .env.example.
+  merged.DB_CONNECTION = input.database.driver;
   return merged;
 }
 

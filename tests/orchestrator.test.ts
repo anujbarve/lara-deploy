@@ -91,6 +91,9 @@ function happyServer(): FakeExecutor {
     })
     .on('artisan migrate --force', { exitCode: 0, stdout: 'Migrated: 2024_02_01_add_slug' })
     .on('mysqldump', { exitCode: 0, stdout: '' })
+    // The release must link shared/.env in, or artisan boots on Laravel's
+    // defaults and migrates a sqlite file instead of MySQL.
+    .on(/readlink .*\.env.*shared\/\.env/, { exitCode: 0, stdout: '' })
     .on('stat -c %s', { stdout: '4096\n' });
   return remote;
 }
@@ -334,6 +337,29 @@ describe('migration failure', () => {
     expect(result.manifest.activated).toBeFalsy();
     expect(result.manifest.steps.some((s) => s.state === 'ACTIVATED')).toBe(false);
     expect(result.failure?.liveAffected).toBe(false);
+  });
+});
+
+describe('release .env link', () => {
+  // The packager excludes .env, so the release only sees the environment if
+  // prepare-release.sh linked shared/.env into it. Without that link artisan
+  // falls back to DB_CONNECTION=sqlite, `artisan migrate` exits 0 after
+  // migrating a throwaway file inside the release, and the deploy reports
+  // success with the provisioned database still empty. This is the check that
+  // turns that silent failure into a loud one.
+  it('aborts before activation when the release cannot see the shared .env', async () => {
+    remote.fail(/readlink .*\.env.*shared\/\.env/);
+    const result = await makeOrchestrator().deploy(new AutoYes());
+
+    expect(result.success).toBe(false);
+    expect(result.failure?.message).toContain('.env');
+    expect(result.manifest.activated).toBeFalsy();
+    expect(result.failure?.liveAffected).toBe(false);
+  });
+
+  it('proceeds when the link points at the shared .env', async () => {
+    const result = await makeOrchestrator().deploy(new AutoYes());
+    expect(result.success).toBe(true);
   });
 });
 

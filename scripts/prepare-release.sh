@@ -180,6 +180,16 @@ if [ "$LD_STRATEGY" != "legacy-root-copy" ]; then
   ln -s "$SHARED_STORAGE" "$TARGET/storage"
   # bootstrap/cache must be writable by the web user but is per-release.
   mkdir -p "$TARGET/bootstrap/cache"
+  # Laravel loads .env from the release base path and nowhere else, and the
+  # real file lives in shared/ so it survives every deploy. Without this link
+  # the release has no .env at all (the packager excludes .env by design), so
+  # every artisan command and every request silently falls back to Laravel's
+  # built-in defaults: DB_CONNECTION=sqlite, APP_URL=http://localhost, and no
+  # APP_KEY at all. That is what made `artisan migrate` write to a sqlite file
+  # inside the release while the provisioned MySQL database stayed empty.
+  # `rm -f` first so a re-run replaces a stray file rather than failing.
+  rm -f "$TARGET/.env"
+  ln -s "$SHARED_DIR/.env" "$TARGET/.env"
   echo "==> Release prepared: $TARGET"
   exit 0
 fi
@@ -231,6 +241,11 @@ done
 # site root — main/public/storage is not what nginx resolves for that URL.
 rm -rf "$LD_ROOT/storage"
 ln -s "$SHARED_STORAGE" "$LD_ROOT/storage"
+
+# Same reasoning as the modern strategy: Laravel resolves .env from its base
+# path, which in legacy mode is $LD_ROOT/$LD_MAIN_DIR.
+rm -f "$TARGET/.env"
+ln -s "$SHARED_DIR/.env" "$TARGET/.env"
 
 # Install the generated bootstrap last, once main/ is fully in place. Writing it
 # any earlier would point the site at a tree that does not exist yet.

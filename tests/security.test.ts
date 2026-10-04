@@ -72,7 +72,7 @@ describe('env validation', () => {
 });
 
 describe('env write strategy', () => {
-  const database = { name: 'client', username: 'client', password: 'genpass', host: '127.0.0.1', port: 3306 };
+  const database = { name: 'client', username: 'client', password: 'genpass', host: '127.0.0.1', port: 3306, driver: 'mysql' };
   const base = {
     remoteEnv: null as Record<string, string> | null,
     isFirstDeploy: true,
@@ -119,6 +119,149 @@ describe('env write strategy', () => {
     expect(parsed.APP_NAME).toBe('FromTemplate');
     expect(parsed.CUSTOM).toBe('yes');
     expect(parsed.APP_ENV).toBe('production');
+  });
+
+  // The real-world case: default envStrategy=preserve against a site whose
+  // .env already exists. Repairing the driver here is what actually stops the
+  // silent wrong-database migration; everything else must survive untouched.
+  it('repairs a drifted DB_CONNECTION even under envStrategy=preserve', () => {
+    const remoteEnv = {
+      APP_KEY: 'base64:keep',
+      DB_CONNECTION: 'sqlite',
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '3306',
+      DB_DATABASE: 'client',
+      DB_USERNAME: 'client',
+      DB_PASSWORD: 'untouched-secret',
+    };
+    const plan = planEnvWrite({ ...base, strategy: 'preserve', isFirstDeploy: false, remoteEnv });
+    expect(plan.contents).not.toBe(null);
+    expect(plan.changedKeys).toEqual(['DB_CONNECTION']);
+    const parsed = parseEnv(plan.contents as string);
+    expect(parsed.DB_CONNECTION).toBe('mysql');
+    // Nothing else is rewritten — not the secret, not the app key.
+    expect(parsed.DB_PASSWORD).toBe('untouched-secret');
+    expect(parsed.APP_KEY).toBe('base64:keep');
+    expect(parsed.DB_DATABASE).toBe('client');
+  });
+
+  it('still writes nothing under preserve when DB_CONNECTION already matches', () => {
+    const plan = planEnvWrite({
+      ...base,
+      strategy: 'preserve',
+      isFirstDeploy: false,
+      remoteEnv: { DB_CONNECTION: 'mysql', APP_KEY: 'base64:keep' },
+    });
+    expect(plan.contents).toBe(null);
+  });
+
+  it('generates an APP_KEY on first deploy when the example ships one empty', () => {
+    const plan = planEnvWrite({
+      ...base,
+      strategy: 'preserve',
+      isFirstDeploy: true,
+      remoteEnv: null,
+      exampleContents: 'APP_KEY=\nDB_CONNECTION=sqlite',
+    });
+    const parsed = parseEnv(plan.contents as string);
+    expect(parsed.APP_KEY).toMatch(/^base64:[A-Za-z0-9+/=]+$/);
+  });
+
+  it('adds a missing APP_KEY under preserve and keeps an existing one', () => {
+    // A .env left by an earlier deploy has no key at all: every request would
+    // throw "No application encryption key has been specified".
+    const missing = planEnvWrite({
+      ...base,
+      strategy: 'preserve',
+      isFirstDeploy: false,
+      remoteEnv: { DB_CONNECTION: 'mysql', DB_PASSWORD: 'untouched-secret' },
+    });
+    expect(missing.changedKeys).toEqual(['APP_KEY']);
+    expect(parseEnv(missing.contents as string).APP_KEY).toMatch(/^base64:/);
+
+    // An existing key is never regenerated, or every session and encrypted
+    // column would break on the next deploy.
+    const present = planEnvWrite({
+      ...base,
+      strategy: 'preserve',
+      isFirstDeploy: false,
+      remoteEnv: { DB_CONNECTION: 'mysql', APP_KEY: 'base64:original' },
+    });
+    expect(present.contents).toBe(null);
+  });
+
+  it('generates a different APP_KEY per deploy only when none exists yet', () => {
+    const first = planEnvWrite({ ...base, strategy: 'preserve', isFirstDeploy: true, remoteEnv: null });
+    const second = planEnvWrite({ ...base, strategy: 'preserve', isFirstDeploy: true, remoteEnv: null });
+    expect(parseEnv(first.contents as string).APP_KEY).not.toBe('');
+    expect(parseEnv(second.contents as string).APP_KEY).not.toBe('');
+  });
+
+  // The Laravel default .env.example ships DB_CONNECTION=sqlite. When that
+  // value survived, the deploy provisioned MySQL and wrote MySQL credentials,
+  // but `artisan migrate` then ran against sqlite inside the release directory
+  // while the real database stayed empty — silently, with a successful deploy.
+  it('forces DB_CONNECTION from the configured driver, not .env.example', () => {
+    const plan = planEnvWrite({
+      ...base,
+      strategy: 'template',
+      templateContents: 'APP_NAME=X\nDB_CONNECTION=sqlite',
+    });
+    expect(parseEnv(plan.contents as string).DB_CONNECTION).toBe('mysql');
+  });
+
+  it('forces DB_CONNECTION on first deploy seeded from .env.example', () => {
+    const plan = planEnvWrite({
+      ...base,
+      strategy: 'preserve',
+      isFirstDeploy: true,
+      remoteEnv: null,
+      exampleContents: 'DB_CONNECTION=sqlite\nDB_DATABASE=local_dev_db',
+    });
+    const parsed = parseEnv(plan.contents as string);
+    expect(parsed.DB_CONNECTION).toBe('mysql');
+    // The example's database name is a development artefact: the deploy
+    // provisioned `client`, so that is the database the app must talk to.
+    expect(parsed.DB_DATABASE).toBe('client');
+  });
+
+  it('keeps a database identity an operator deliberately set on the server', () => {
+    // The forced block runs after the "existing values win" merge, so a value
+    // the operator changed in place is never clobbered by the config.
+    const plan = planEnvWrite({
+      ...base,
+      strategy: 'generate',
+      isFirstDeploy: false,
+      remoteEnv: { DB_HOST: '10.0.0.5', DB_DATABASE: 'other_db' },
+      generateKeys: ['APP_KEY'],
+    });
+    const parsed = parseEnv(plan.contents as string);
+    expect(parsed.DB_HOST).toBe('10.0.0.5');
+    expect(parsed.DB_DATABASE).toBe('other_db');
+    expect(parsed.DB_CONNECTION).toBe('mysql');
+  });
+
+  it('repairs a server .env left on sqlite by an earlier deploy', () => {
+    // The "existing server values win" rule used to preserve this forever, so
+    // every subsequent deploy kept migrating sqlite.
+    const plan = planEnvWrite({
+      ...base,
+      strategy: 'generate',
+      isFirstDeploy: false,
+      remoteEnv: { DB_CONNECTION: 'sqlite', DB_PASSWORD: 'set' },
+      generateKeys: ['APP_KEY'],
+    });
+    expect(parseEnv(plan.contents as string).DB_CONNECTION).toBe('mysql');
+  });
+
+  it('honours a mariadb driver', () => {
+    const plan = planEnvWrite({
+      ...base,
+      database: { ...base.database, driver: 'mariadb' },
+      strategy: 'template',
+      templateContents: 'DB_CONNECTION=sqlite',
+    });
+    expect(parseEnv(plan.contents as string).DB_CONNECTION).toBe('mariadb');
   });
 
   it('only generates missing keys, never overwriting existing ones', () => {

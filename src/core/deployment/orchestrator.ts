@@ -885,6 +885,22 @@ export class DeploymentOrchestrator {
       const index = await executor.exec(`test -f ${q(`${this.layout.root}/index.php`)}`, { allowFailure: true });
       if (index.exitCode !== 0) missing.push('index.php (document root)');
     }
+
+    // Laravel loads .env from the release base path and nowhere else, and the
+    // packager excludes .env by design, so the release must link the shared one
+    // in. Without that link the app and artisan both boot on Laravel's
+    // defaults — DB_CONNECTION falls back to sqlite — so `artisan migrate`
+    // writes to a throwaway file inside the release instead of the database
+    // this deploy provisioned and backed up, and the deploy still reports
+    // success. The link target itself is allowed to be absent at this point,
+    // because the .env is written immediately after this check; what matters
+    // is that the link points at the shared location rather than nowhere.
+    const envLink = await executor.exec(
+      `test "$(readlink ${q(`${releaseDir}/.env`)} 2>/dev/null)" = ${q(this.layout.envPath)}`,
+      { allowFailure: true },
+    );
+    if (envLink.exitCode !== 0) missing.push('.env (link to shared)');
+
     return missing;
   }
 
@@ -991,6 +1007,7 @@ export class DeploymentOrchestrator {
         password: dbPassword,
         host: config.database.host,
         port: config.database.port,
+        driver: config.database.driver,
       },
       ...(templateContents ? { templateContents } : {}),
       ...(uploadContents ? { uploadContents } : {}),
