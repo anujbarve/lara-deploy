@@ -41,6 +41,10 @@ export function registerStatusCommand(program: Command): void {
             phpBinary: ctx.config.php.remoteBinary ?? ctx.config.php.binary,
             queue: ctx.config.queue,
             scheduler: ctx.config.scheduler,
+            // Without this the SSL check runs even when the project is
+            // explicitly HTTP-only, and reports a failure that the operator
+            // has already opted out of.
+            sslEnabled: ctx.config.ssl.enabled,
             projectSlug: slugify(project.name),
             clock: ctx.clock,
           });

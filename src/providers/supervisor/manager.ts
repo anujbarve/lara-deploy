@@ -32,13 +32,50 @@ export interface SupervisorInstallResult {
   restart: boolean;
 }
 
+/**
+ * Where supervisorctl may live, most specific first. aaPanel installs its own
+ * copy inside its bundled Python and does not expose it on the SSH user's PATH.
+ */
+const SUPERVISORCTL_CANDIDATES = [
+  'supervisorctl',
+  '/www/server/panel/pyenv/bin/supervisorctl',
+  '/usr/local/bin/supervisorctl',
+  '/usr/bin/supervisorctl',
+] as const;
+
 export class SupervisorManager {
   private readonly configDir: string;
   private readonly ctl: string;
+  private resolvedCtl: string | null = null;
 
   constructor(private readonly options: SupervisorManagerOptions) {
     this.configDir = options.configDir ?? '/etc/supervisor/conf.d';
     this.ctl = options.ctl ?? 'supervisorctl';
+  }
+
+  /**
+   * The supervisorctl to invoke.
+   *
+   * aaPanel does not put supervisorctl on an SSH user's PATH — it ships one
+   * inside its bundled Python at /www/server/panel/pyenv/bin — so calling the
+   * bare name fails with "command not found" even on a server where supervisor
+   * is installed and running. Resolve it once and cache the answer.
+   */
+  private async ctlPath(): Promise<string> {
+    if (this.options.ctl) return this.ctl;
+    if (this.resolvedCtl) return this.resolvedCtl;
+    const result = await this.run(
+      `for candidate in ${SUPERVISORCTL_CANDIDATES.map((c) => q(c)).join(' ')}; do
+  if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; exit 0; fi
+  if [ -x "$candidate" ]; then echo "$candidate"; exit 0; fi
+done
+exit 1`,
+      { allowFailure: true, label: 'locate supervisorctl' },
+    );
+    const found = result.exitCode === 0 ? result.stdout.trim().split('\n').pop()?.trim() : '';
+    if (!found) return this.ctl; // Keep the bare name so the error names it.
+    this.resolvedCtl = found;
+    return found;
   }
 
   /** Path of the program definition for a given name. */
@@ -132,9 +169,10 @@ export class SupervisorManager {
     }
 
     // Pick up new/changed definitions without touching other programs.
-    await this.run(`${this.ctl} reread`, { allowFailure: true, label: 'supervisor reread' });
+    const ctl = await this.ctlPath();
+    await this.run(`${ctl} reread`, { allowFailure: true, label: 'supervisor reread' });
     await this.run(
-      `cd ${q('/etc/supervisor*')} 2>/dev/null || true; ${this.ctl} update`,
+      `cd ${q('/etc/supervisor*')} 2>/dev/null || true; ${ctl} update`,
       { allowFailure: true, label: 'supervisor update' },
     );
 
@@ -159,7 +197,7 @@ export class SupervisorManager {
    */
   async restart(names: readonly string[], options: { waitSeconds?: number } = {}): Promise<boolean> {
     if (names.length === 0) return false;
-    const result = await this.run(`${this.ctl} restart ${this.ctlArgs(names)}`, {
+    const result = await this.run(`${await this.ctlPath()} restart ${this.ctlArgs(names)}`, {
       label: 'supervisor restart',
     });
     if (result.exitCode !== 0) return false;
@@ -185,13 +223,15 @@ export class SupervisorManager {
   /** Stop only the named programs. */
   async stop(names: readonly string[]): Promise<boolean> {
     if (names.length === 0) return false;
-    const result = await this.run(`${this.ctl} stop ${this.ctlArgs(names)}`, { allowFailure: true });
+    const result = await this.run(`${await this.ctlPath()} stop ${this.ctlArgs(names)}`, {
+      allowFailure: true,
+    });
     return result.exitCode === 0;
   }
 
   /** All supervisor processes, filtered to ours. */
   async status(): Promise<ReturnType<typeof parseSupervisorStatus>> {
-    const result = await this.run(`${this.ctl} status`, { allowFailure: true });
+    const result = await this.run(`${await this.ctlPath()} status`, { allowFailure: true });
     if (result.exitCode !== 0) return [];
     const parsed = parseSupervisorStatus(result.stdout);
     return parsed.filter((row) => row.name.startsWith('laravel-'));
@@ -214,8 +254,9 @@ export class SupervisorManager {
       }
       await this.stop([name]);
       await this.run(`rm -f ${q(file)}`, { label: 'remove supervisor program' });
-      await this.run(`${this.ctl} reread`, { allowFailure: true });
-      await this.run(`${this.ctl} update`, { allowFailure: true });
+      const ctl = await this.ctlPath();
+      await this.run(`${ctl} reread`, { allowFailure: true });
+      await this.run(`${ctl} update`, { allowFailure: true });
       removed.push(name);
     }
     return removed;
@@ -234,7 +275,10 @@ export class SupervisorManager {
 
   /** True when supervisorctl exists. */
   async available(): Promise<boolean> {
-    const result = await this.run('command -v supervisorctl', { allowFailure: true });
+    const resolved = await this.ctlPath();
+    const result = await this.run(`test -x ${q(resolved)} || command -v ${q(resolved)}`, {
+      allowFailure: true,
+    });
     return result.exitCode === 0;
   }
 

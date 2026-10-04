@@ -5,7 +5,7 @@ import {
   ensureDatabase,
   ensureSsl,
 } from '../src/providers/aapanel/adapter.js';
-import { AaPanelClient } from '../src/providers/aapanel/client.js';
+import { AaPanelClient, md5hex, getDataParams } from '../src/providers/aapanel/client.js';
 import { MysqlProvider } from '../src/providers/mysql/provider.js';
 import { SupervisorManager } from '../src/providers/supervisor/manager.js';
 import { CronManager } from '../src/providers/cron/manager.js';
@@ -161,7 +161,36 @@ describe('ensure* idempotency', () => {
 });
 
 describe('aaPanel HTTP client', () => {
-  it('sends the API key in the body, never in the URL', async () => {
+  it('authenticates with the timestamped token aaPanel expects', async () => {
+    // aaPanel does not accept `key=<secret>`. It wants
+    // request_token = MD5(request_time + MD5(api_secret_key)); sending the bare
+    // key is rejected, which is why the API path never worked.
+    const calls: Array<{ url: string; body: string }> = [];
+    const fetchImpl = (async (url: string, init: { body: string }) => {
+      calls.push({ url, body: init.body });
+      return new Response(JSON.stringify({ status: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const client = new AaPanelClient({
+      baseUrl: 'https://1.2.3.4:7800',
+      apiKey: 'super-secret-key',
+      timeoutMs: 5000,
+      insecureTLS: false,
+      fetchImpl,
+    });
+
+    await client.request('GetSiteList', { name: 'example.com' });
+
+    const params = new URLSearchParams(calls[0]?.body ?? '');
+    const time = params.get('request_time') ?? '';
+    expect(time).toMatch(/^\d{13}$/);
+    expect(params.get('request_token')).toBe(
+      md5hex(`${time}${md5hex('super-secret-key')}`),
+    );
+    expect(params.get('key')).toBeNull();
+  });
+
+  it('never puts the secret in the URL or the raw body', async () => {
     const calls: Array<{ url: string; body: string }> = [];
     const fetchImpl = (async (url: string, init: { body: string }) => {
       calls.push({ url, body: init.body });
@@ -179,7 +208,8 @@ describe('aaPanel HTTP client', () => {
     await client.request('GetSiteList', { name: 'example.com' });
     expect(calls[0]?.url).toContain('action=GetSiteList');
     expect(calls[0]?.url).not.toContain('super-secret-key');
-    expect(calls[0]?.body).toContain('key=super-secret-key');
+    // The key only ever appears hashed, so a proxy log cannot recover it.
+    expect(calls[0]?.body).not.toContain('super-secret-key');
   });
 
   it('throws an actionable error on a non-JSON response', async () => {
@@ -208,6 +238,411 @@ describe('aaPanel HTTP client', () => {
       fetchImpl,
     });
     await expect(client.request('AddSite')).rejects.toThrow(/API key error/);
+  });
+});
+
+describe('aaPanel API routing', () => {
+  function recorder(responses: Record<string, unknown>) {
+    const calls: Array<{ url: string; body: string }> = [];
+    const fetchImpl = (async (url: string, init: { body: string }) => {
+      calls.push({ url, body: init.body });
+      const action = new URL(url).searchParams.get('action') ?? '';
+      return new Response(JSON.stringify(responses[action] ?? { status: 0, message: {} }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+    return { calls, fetchImpl };
+  }
+
+  function client(fetchImpl: typeof fetch): AaPanelClient {
+    return new AaPanelClient({
+      baseUrl: 'https://1.2.3.4:7800',
+      apiKey: 'k',
+      timeoutMs: 5000,
+      insecureTLS: false,
+      fetchImpl,
+    });
+  }
+
+  it('sends AddDatabase to the database route, not /v2/data', async () => {
+    // Every /v2 route has its own action allowlist, and an action posted to the
+    // wrong one is answered with "Specific parameters are invalid!" — the exact
+    // message an unknown action produces, so the route is easy to get wrong.
+    const { calls, fetchImpl } = recorder({ AddDatabase: { status: 0, message: { id: 7 } } });
+    await client(fetchImpl).requestOn('database', 'AddDatabase', { name: 'app' });
+
+    expect(calls[0]?.url).toContain('/v2/database?action=AddDatabase');
+    expect(new URL(calls[0]?.url ?? '').pathname).toBe('/v2/database');
+  });
+
+  it('sends AddSite to the site route with webname as a JSON string', async () => {
+    const { calls, fetchImpl } = recorder({ AddSite: { status: 0, message: { siteId: 12 } } });
+    await client(fetchImpl).requestOn('site', 'AddSite', {
+      webname: JSON.stringify({ domain: 'example.com', domainlist: [] }),
+    });
+
+    expect(calls[0]?.url).toContain('/v2/site?action=AddSite');
+    const params = new URLSearchParams(calls[0]?.body ?? '');
+    // aaPanel json.loads() this value; a bare domain is rejected as malformed.
+    expect(JSON.parse(params.get('webname') ?? '{}')).toEqual({
+      domain: 'example.com',
+      domainlist: [],
+    });
+  });
+
+  it('reports the reason from message.result, not "unknown error"', async () => {
+    // Validation failures come back as {status: -1, message: {result: "..."}}
+    // with no `msg` field, so reading only `msg` hides the actual cause.
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({ status: -1, message: { result: 'Database name cannot contain special characters' } }),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+
+    await expect(
+      client(fetchImpl).requestOn('database', 'AddDatabase', {}),
+    ).rejects.toThrow(/Database name cannot contain special characters/);
+  });
+
+  it('always sends the full getData parameter set', async () => {
+    // getData validates strictly and rejects the call when any parameter is
+    // missing — including when its value is empty.
+    const { calls, fetchImpl } = recorder({ getData: { status: 0, message: { data: [] } } });
+    await client(fetchImpl).requestOn('data', 'getData', getDataParams('databases'));
+
+    const params = new URLSearchParams(calls[0]?.body ?? '');
+    for (const key of ['p', 'limit', 'table', 'search', 'order', 'type']) {
+      expect(params.has(key), `getData requires "${key}"`).toBe(true);
+    }
+    expect(params.get('table')).toBe('databases');
+  });
+});
+
+describe('aaPanel adapter API calls', () => {
+  const profile = {
+    name: 'p',
+    host: '1.2.3.4',
+    port: 22,
+    username: 'root',
+    siteRoot: '/www/wwwroot',
+  } as never;
+  const config = {
+    enabled: true,
+    url: 'https://1.2.3.4:7800',
+    forceSsh: false,
+    fallbackToSsh: false,
+    timeoutMs: 5000,
+    insecureTLS: false,
+  } as never;
+
+  function adapterWith(calls: Array<{ url: string; body: string }>, messageFor: (action: string) => unknown) {
+    const fetchImpl = (async (url: string, init: { body: string }) => {
+      calls.push({ url, body: init.body });
+      const action = new URL(url).searchParams.get('action') ?? '';
+      return new Response(JSON.stringify(messageFor(action)), { status: 200 });
+    }) as unknown as typeof fetch;
+    return new AaPanelAdapter({
+      profile,
+      config,
+      executor: new FakeExecutor(),
+      clientFactory: () =>
+        new AaPanelClient({
+          baseUrl: 'https://1.2.3.4:7800',
+          apiKey: 'k',
+          timeoutMs: 5000,
+          insecureTLS: false,
+          fetchImpl,
+        }),
+    });
+  }
+
+  it('creates a database with the parameters the panel schema requires', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'AddDatabase'
+        ? { status: 0, message: { id: 1 } }
+        : { status: 0, message: { data: [] } },
+    );
+
+    await adapter.createDatabase({ name: 'app', username: 'app', password: 'p' });
+
+    const add = calls.find((c) => c.url.includes('AddDatabase'));
+    expect(add?.url).toContain('/v2/database');
+    const params = new URLSearchParams(add?.body ?? '');
+    // db_user/address/codeing/sid/active/dtype are all required by the panel's
+    // validator; a missing one is answered with "<field> is required".
+    for (const key of ['name', 'db_user', 'password', 'codeing', 'address', 'sid', 'active', 'dtype', 'ps']) {
+      expect(params.has(key), `AddDatabase requires "${key}"`).toBe(true);
+    }
+    expect(params.get('db_user')).toBe('app');
+    expect(params.get('address')).toBe('localhost');
+  });
+
+  it('reads the database list from getData so panel-registered databases are found', async () => {
+    // A database created with raw SQL over SSH exists in MySQL but is absent
+    // from the panel's own table, so it is invisible in aaPanel. Reading the
+    // panel's list is what makes ensureDatabase idempotent for managed ones.
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'getData'
+        ? {
+            status: 0,
+            message: {
+              data: [{ id: 3, name: 'app', username: 'app', accept: 'localhost' }],
+            },
+          }
+        : { status: 0, message: {} },
+    );
+
+    expect(await adapter.databaseExists('app')).toBe(true);
+    expect(await adapter.databaseExists('other')).toBe(false);
+
+    const params = new URLSearchParams(calls[0]?.body ?? '');
+    expect(calls[0]?.url).toContain('action=getData');
+    expect(params.get('table')).toBe('databases');
+  });
+
+  it('sets the PHP version using "version", which is the parameter the panel reads', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'getData'
+        ? { status: 0, message: { data: [{ id: 9, name: 'example.com', path: '/www/wwwroot/example.com' }] } }
+        : { status: 0, message: { result: 'ok' } },
+    );
+
+    await adapter.setPhpVersion('example.com', '82');
+
+    const call = calls.find((c) => c.url.includes('SetPHPVersion'));
+    const params = new URLSearchParams(call?.body ?? '');
+    expect(call?.url).toContain('/v2/site');
+    expect(params.get('version')).toBe('82');
+    expect(params.get('siteName')).toBe('example.com');
+  });
+
+  it('sets the document root as a path relative to the site root', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'getData'
+        ? { status: 0, message: { data: [{ id: 9, name: 'example.com', path: '/www/wwwroot/example.com' }] } }
+        : { status: 0, message: { result: 'ok' } },
+    );
+
+    await adapter.updateSiteConfig({
+      domain: 'example.com',
+      documentRoot: '/www/wwwroot/example.com/current/public',
+    });
+
+    const call = calls.find((c) => c.url.includes('SetSiteRunPath'));
+    const params = new URLSearchParams(call?.body ?? '');
+    // SetSiteRunPath concatenates runPath onto the site's own path, so an
+    // absolute path here would produce a nonsense root like /www/wwwroot/x/www/...
+    expect(params.get('runPath')).toBe('/current/public');
+    expect(params.get('id')).toBe('9');
+  });
+
+  it('refuses a document root outside the site root', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'getData'
+        ? { status: 0, message: { data: [{ id: 9, name: 'example.com', path: '/www/wwwroot/example.com' }] } }
+        : { status: 0, message: { result: 'ok' } },
+    );
+
+    await expect(
+      adapter.updateSiteConfig({ domain: 'example.com', documentRoot: '/somewhere/else' }),
+    ).rejects.toThrow(/outside the site root/);
+  });
+
+  it('takes the domain from "name", not from the row\'s "domain" field', async () => {
+    // In a getData site row, `domain` is the NUMBER of domains bound to the
+    // site. Reading it as the hostname yields "domain: 1", and every hostname
+    // comparison then fails — indistinguishable from "the site is missing".
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'getData'
+        ? {
+            status: 0,
+            message: {
+              data: [
+                {
+                  id: 25,
+                  name: 'example.com',
+                  path: '/www/wwwroot/example.com',
+                  domain: 1,
+                  php_version: '8.3',
+                },
+              ],
+            },
+          }
+        : { status: 0, message: { status: false } },
+    );
+
+    const site = await adapter.getWebsite('example.com');
+
+    expect(site).not.toBeNull();
+    expect(site?.domain).toBe('example.com');
+    expect(site?.root).toBe('/www/wwwroot/example.com');
+    expect(site?.phpVersion).toBe('8.3');
+  });
+
+  it('searches server-side instead of reading a capped page of sites', async () => {
+    // Reading the first N sites silently reports "not found" for any site
+    // beyond the page. The panel's search is a substring match, so the exact
+    // match is still done locally.
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, () => ({ status: 0, message: { data: [] } }));
+
+    expect(await adapter.websiteExists('example.com')).toBe(false);
+
+    const params = new URLSearchParams(calls[0]?.body ?? '');
+    expect(params.get('table')).toBe('sites');
+    expect(params.get('search')).toBe('example.com');
+  });
+
+  it('reports the served directory, not just the webroot', async () => {
+    // aaPanel stores the serving directory separately from the site's path, as
+    // a run path relative to it. Reporting the webroot as the document root
+    // makes a correctly configured site look misconfigured.
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) => {
+      if (action === 'getData') {
+        return {
+          status: 0,
+          message: {
+            data: [{ id: 9, name: 'example.com', path: '/www/wwwroot/example.com' }],
+          },
+        };
+      }
+      if (action === 'GetSiteRunPath') {
+        return { status: 0, message: { runPath: '/current/public', dirs: [] } };
+      }
+      return { status: 0, message: { status: false } };
+    });
+
+    const config = await adapter.getSiteConfig('example.com');
+
+    expect(config?.documentRoot).toBe('/www/wwwroot/example.com/current/public');
+  });
+
+  it('falls back to the webroot when the run path is the site root', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) => {
+      if (action === 'getData') {
+        return {
+          status: 0,
+          message: {
+            data: [{ id: 9, name: 'example.com', path: '/www/wwwroot/example.com' }],
+          },
+        };
+      }
+      if (action === 'GetSiteRunPath') {
+        return { status: 0, message: { runPath: '/', dirs: [] } };
+      }
+      return { status: 0, message: { status: false } };
+    });
+
+    expect((await adapter.getSiteConfig('example.com'))?.documentRoot).toBe(
+      '/www/wwwroot/example.com',
+    );
+  });
+
+  it('refuses to create a site over a webroot that still holds a deployment', async () => {
+    // aaPanel deletes the site path on creation. A previous release's
+    // releases/, current symlink, shared/.env and deploy history all live
+    // there, so provisioning after an upload silently destroys them.
+    const calls: Array<{ url: string; body: string }> = [];
+    const executor = new FakeExecutor().on('test -e', {
+      stdout: '/www/wwwroot/example.com/releases\n',
+    });
+    const fetchImpl = (async (url: string, init: { body: string }) => {
+      calls.push({ url, body: init.body });
+      return new Response(JSON.stringify({ status: 0, message: { data: [] } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const adapter = new AaPanelAdapter({
+      profile,
+      config,
+      executor,
+      clientFactory: () =>
+        new AaPanelClient({
+          baseUrl: 'https://1.2.3.4:7800',
+          apiKey: 'k',
+          timeoutMs: 5000,
+          insecureTLS: false,
+          fetchImpl,
+        }),
+    });
+
+    await expect(
+      adapter.createWebsite({ domain: 'example.com', root: '/www/wwwroot/example.com' }),
+    ).rejects.toThrow(/not empty/);
+    // The destructive call must not have been made.
+    expect(calls.some((c) => c.url.includes('AddSite'))).toBe(false);
+  });
+
+  it('creates the site when the webroot is empty or absent', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const executor = new FakeExecutor().on('test -e', { exitCode: 1, stdout: '' });
+    const fetchImpl = (async (url: string, init: { body: string }) => {
+      calls.push({ url, body: init.body });
+      const action = new URL(url).searchParams.get('action') ?? '';
+      if (action === 'AddSite') return new Response(JSON.stringify({ status: 0, message: { siteId: 5 } }), { status: 200 });
+      return new Response(JSON.stringify({ status: 0, message: { data: [] } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const adapter = new AaPanelAdapter({
+      profile,
+      config,
+      executor,
+      clientFactory: () =>
+        new AaPanelClient({
+          baseUrl: 'https://1.2.3.4:7800',
+          apiKey: 'k',
+          timeoutMs: 5000,
+          insecureTLS: false,
+          fetchImpl,
+        }),
+    });
+
+    await adapter.createWebsite({ domain: 'example.com', root: '/www/wwwroot/example.com' });
+    expect(calls.some((c) => c.url.includes('AddSite'))).toBe(true);
+  });
+
+  it('reads SSL state from cert_data, which is where the panel puts it', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, (action) =>
+      action === 'GetSSL'
+        ? {
+            status: 0,
+            message: {
+              status: true,
+              cert_data: {
+                notAfter: '2026-12-26',
+                issuer_O: "Let's Encrypt",
+                dns: ['example.com'],
+              },
+            },
+          }
+        : { status: 0, message: {} },
+    );
+
+    const ssl = await adapter.getSslStatus('example.com');
+
+    expect(ssl.enabled).toBe(true);
+    expect(ssl.provider).toBe('letsencrypt');
+    // The panel has no top-level endtime field; the real expiry is nested.
+    expect(ssl.expiry).toBe('2026-12-26');
+    expect(ssl.domains).toEqual(['example.com']);
+    expect(calls[0]?.url).toContain('/v2/site?action=GetSSL');
+  });
+
+  it('reports no SSL when the panel rejects the unknown site', async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const adapter = adapterWith(calls, () => ({ status: -1, message: { result: 'not found' } }));
+
+    expect(await adapter.getSslStatus('missing.example.com')).toEqual({
+      enabled: false,
+      provider: 'none',
+      domains: [],
+    });
   });
 });
 
@@ -286,6 +721,39 @@ describe('supervisor manager', () => {
     expect(contents).toContain('--queue=database');
     // Never world-writable or root-owned-forever.
     expect(contents).not.toContain('777');
+  });
+
+  it('finds supervisorctl where aaPanel keeps it', async () => {
+    // aaPanel does not put supervisorctl on an SSH user's PATH; it ships one
+    // in its bundled Python. Calling the bare name fails with "command not
+    // found" even though supervisor is installed and running.
+    const executor = new FakeExecutor().on('for candidate in', {
+      stdout: '/www/server/panel/pyenv/bin/supervisorctl\n',
+    });
+    const manager = new SupervisorManager({ executor });
+
+    await manager.restart(['laravel-client-site-worker']);
+
+    const restart = executor.commands.find((c) => c.includes(' restart '));
+    expect(restart).toContain('/www/server/panel/pyenv/bin/supervisorctl');
+  });
+
+  it('prefers supervisorctl from PATH when it is there', async () => {
+    const executor = new FakeExecutor().on('for candidate in', {
+      stdout: '/usr/bin/supervisorctl\n',
+    });
+    await new SupervisorManager({ executor }).status();
+    expect(executor.commands.find((c) => c.includes(' status'))).toContain('/usr/bin/supervisorctl');
+  });
+
+  it('looks for supervisorctl only once', async () => {
+    const executor = new FakeExecutor().on('for candidate in', {
+      stdout: '/usr/bin/supervisorctl\n',
+    });
+    const manager = new SupervisorManager({ executor });
+    await manager.status();
+    await manager.status();
+    expect(executor.commands.filter((c) => c.includes('for candidate in'))).toHaveLength(1);
   });
 
   it('reports a restart that leaves the workers dead', async () => {

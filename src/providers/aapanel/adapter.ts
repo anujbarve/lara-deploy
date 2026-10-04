@@ -12,7 +12,8 @@
 
 import { PanelError, MissingCredentialError } from '../../core/errors/errors.js';
 import { q, assertRemotePath, assertHostname } from '../../utils/shell.js';
-import { AaPanelClient, assertPanelUrl } from './client.js';
+import { AaPanelClient, assertPanelUrl, getDataParams, isSuccess } from './client.js';
+import type { AaPanelResponse } from './client.js';
 import type {
   PanelAdapter,
   PanelAvailability,
@@ -25,6 +26,11 @@ import type { RemoteExecutor } from '../exec/types.js';
 import type { AaPanelConfig, ServerProfile } from '../../core/config/schema.js';
 import type { Logger } from '../../utils/logger.js';
 import { nullLogger } from '../../utils/logger.js';
+
+/** aaPanel's SQLite config database, where it keeps the MySQL root password. */
+const AA_PANEL_DB = '/www/server/panel/data/default.db';
+/** The socket aaPanel's MySQL listens on. */
+const AA_PANEL_MYSQL_SOCKET = '/tmp/mysql.sock';
 
 export interface AaPanelAdapterOptions {
   profile: ServerProfile;
@@ -60,6 +66,7 @@ export class AaPanelAdapter implements PanelAdapter {
         apiKey: apiKey as string,
         timeoutMs: options.config.timeoutMs,
         insecureTLS: options.config.insecureTLS,
+        ...(options.config.hostHeader ? { hostHeader: options.config.hostHeader } : {}),
         logger: this.logger,
       });
     } else {
@@ -143,8 +150,8 @@ export class AaPanelAdapter implements PanelAdapter {
   async websiteExists(domain: string): Promise<boolean> {
     assertHostname(domain);
     if (this.client) {
-      const list = await this.siteListApi();
-      return list.some((site) => site.domain === domain || site.name === domain);
+      const list = await this.siteListApi(domain);
+      return list.some((site) => site.name === domain);
     }
     // SSH discovery: the panel writes one directory per site.
     const base = `${this.options.profile.siteRoot}/${domain}`;
@@ -155,18 +162,18 @@ export class AaPanelAdapter implements PanelAdapter {
   async getWebsite(domain: string): Promise<WebsiteInfo | null> {
     assertHostname(domain);
     if (this.client) {
-      const list = await this.siteListApi();
-      const found = list.find((site) => site.domain === domain || site.name === domain);
+      const list = await this.siteListApi(domain);
+      const found = list.find((site) => site.name === domain);
       if (!found) return null;
       const ssl = await this.getSslStatus(domain);
       return {
         name: found.name,
-        domain: found.domain ?? found.name,
-        port: found.port ?? 80,
+        domain: found.name,
+        port: 80,
         root: found.path,
         documentRoot: found.path,
         status: 'running',
-        phpVersion: found.phpVersion,
+        phpVersion: found.php_version,
         sslEnabled: ssl.enabled,
         sslExpiry: ssl.expiry ?? null,
       };
@@ -205,16 +212,32 @@ export class AaPanelAdapter implements PanelAdapter {
         remediation: ['Remove --no-provision, or create the website in aaPanel manually.'],
       });
     }
+    await this.assertWebrootIsSafe(input.root, input.domain);
 
     if (this.client) {
-      const response = await this.client.request('AddSite', {
-        domain: input.domain,
+      // AddSite lives on /v2/site, not /v2/data, and validates `webname` as a
+      // JSON string — not a bare `domain` field. Every declared parameter is
+      // sent: the panel rejects the whole call if one is absent.
+      const response = await this.client.requestOn('site', 'AddSite', {
+        webname: JSON.stringify({ domain: input.domain, domainlist: [] }),
         path: input.root,
         port: 80,
-        psr: input.phpVersion,
-        type: 'php',
+        version: input.phpVersion ?? '',
+        ps: input.domain,
+        type: '',
+        sql: '',
+        datapassword: '',
+        codeing: 'utf8mb4',
+        type_id: 0,
+        force_ssl: 0,
+        ftp: 'false',
+        is_create_default_file: 'true',
+        ssl_auto: 0,
+        sub_dir: '',
+        project_type: 'PHP',
       });
-      const siteId = typeof response.siteId === 'number' ? response.siteId : undefined;
+      const payload = response.message as { siteId?: unknown } | undefined;
+      const siteId = typeof payload?.siteId === 'number' ? payload.siteId : undefined;
       if (siteId !== undefined && input.phpVersion) {
         await this.setPhpVersion(input.domain, input.phpVersion);
       }
@@ -239,6 +262,40 @@ export class AaPanelAdapter implements PanelAdapter {
       status: 'running',
       phpVersion: input.phpVersion,
     };
+  }
+
+  /**
+   * Refuse to create a site over a webroot that already holds something.
+   *
+   * aaPanel deletes the contents of the site path when it creates a website —
+   * there is no "directory is not empty" guard on the API path, unlike the
+   * panel UI which asks first. A previous deployment's `releases/`, `current`
+   * symlink, `shared/.env` and deploy history all live under this directory, so
+   * creating the site after an upload silently destroys the deployed release.
+   * This must be checked before calling AddSite, and must also work when the
+   * panel API is unavailable (the SSH path creates the site too).
+   */
+  private async assertWebrootIsSafe(root: string, domain: string): Promise<void> {
+    const marker = `${root.replace(/\/+$/, '')}/.deploy`;
+    const result = await this.options.executor.exec(
+      `test -e ${q(marker)} && echo DEPLOY_MARKER || { test -d ${q(root)} && find ${q(root)} -mindepth 1 -maxdepth 1 | head -1; }`,
+      { allowFailure: true, timeoutMs: 15_000 },
+    );
+    // A non-zero exit means the directory does not exist, which is the safe case.
+    if (result.exitCode !== 0) return;
+    const output = result.stdout.trim();
+    if (output === '') return;
+    throw new PanelError(
+      `Refusing to create the website for ${domain}: ${root} is not empty.`,
+      {
+        details: { firstEntry: output },
+        remediation: [
+          `aaPanel deletes the site path on creation, which would destroy ${output}.`,
+          'Move the directory aside, or create the website in aaPanel first so the deploy reuses it.',
+          'If this webroot is unrelated to the deploy, set site.root to a dedicated directory.',
+        ],
+      },
+    );
   }
 
   private async createWebsiteViaSsh(input: { domain: string; root: string; phpVersion?: string }): Promise<void> {
@@ -271,10 +328,10 @@ export class AaPanelAdapter implements PanelAdapter {
       throw new PanelError('Refusing to delete a website while provisioning is disabled.');
     }
     if (this.client) {
-      const list = await this.siteListApi();
-      const found = list.find((site) => site.domain === domain);
+      const list = await this.siteListApi(domain);
+      const found = list.find((site) => site.name === domain);
       if (!found) return false;
-      await this.client.request('DeleteSite', { id: found.id });
+      await this.client.requestOn('site', 'DeleteSite', { id: found.id });
       return true;
     }
     const result = await this.options.executor.exec(
@@ -290,7 +347,7 @@ export class AaPanelAdapter implements PanelAdapter {
 
   async databaseExists(name: string): Promise<boolean> {
     if (this.client) {
-      const list = await this.databaseListApi();
+      const list = await this.databaseListApi(name);
       return list.some((db) => db.name === name);
     }
     const result = await this.options.executor.exec(
@@ -302,13 +359,14 @@ export class AaPanelAdapter implements PanelAdapter {
 
   async getDatabase(name: string): Promise<DatabaseInfo | null> {
     if (this.client) {
-      const list = await this.databaseListApi();
+      const list = await this.databaseListApi(name);
       const found = list.find((db) => db.name === name);
       if (!found) return null;
       return {
         name: found.name,
         username: found.username,
-        host: found.host ?? 'localhost',
+        // aaPanel records the granted access hosts rather than a single host.
+        host: found.host ?? found.accept ?? 'localhost',
         port: found.port ?? 3306,
         accept: true,
       };
@@ -334,12 +392,22 @@ export class AaPanelAdapter implements PanelAdapter {
     }
 
     if (this.client) {
-      await this.client.request('AddDatabase', {
+      // AddDatabase lives on /v2/database. Its parameters are validated by a
+      // strict schema: `db_user` (not `user`), `address` (not `access`), plus
+      // `codeing`, `sid`, `active` and `dtype`. A missing one is answered with
+      // "<field> is required", which this client used to report as a bare
+      // "Specific parameters are invalid!" — the same message as an action the
+      // panel does not know, so the cause was impossible to see from the error.
+      await this.client.requestOn('database', 'AddDatabase', {
         name: input.name,
-        user: input.username,
+        db_user: input.username,
         password: input.password,
-        access: '127.0.0.1',
-        psw: input.password,
+        codeing: 'utf8mb4',
+        address: input.host ?? 'localhost',
+        sid: 0,
+        active: 'true',
+        dtype: 'mysql',
+        ps: input.name,
       });
     } else {
       // MysqlProvider owns SQL execution; the adapter delegates.
@@ -362,7 +430,27 @@ export class AaPanelAdapter implements PanelAdapter {
 
   private async mysqlProvider() {
     const { MysqlProvider } = await import('../mysql/provider.js');
-    return new MysqlProvider({ executor: this.options.executor, logger: this.logger });
+    // aaPanel stores the MySQL root password in its own SQLite database, and
+    // it is not empty on every install. MysqlProvider's default assumes a
+    // passwordless socket, which fails with "Access denied for user root" on
+    // any server that has actually set one.
+    const root = await this.mysqlRootCredentials();
+    return new MysqlProvider({ executor: this.options.executor, logger: this.logger, ...(root ? { root } : {}) });
+  }
+
+  /**
+   * The root credentials aaPanel uses, read from its config database. Returns
+   * null when they cannot be read, leaving the caller's defaults in place
+   * rather than inventing credentials.
+   */
+  private async mysqlRootCredentials(): Promise<{ username: string; password: string; socket: string } | null> {
+    const result = await this.options.executor.exec(
+      `sqlite3 ${q(AA_PANEL_DB)} ${q(`SELECT mysql_root FROM config LIMIT 1;`)} 2>/dev/null`,
+      { allowFailure: true, timeoutMs: 15_000 },
+    );
+    const password = result.exitCode === 0 ? result.stdout.trim() : '';
+    if (password === '') return null;
+    return { username: 'root', password, socket: AA_PANEL_MYSQL_SOCKET };
   }
 
   // -------------------------------------------------------------------------
@@ -372,13 +460,24 @@ export class AaPanelAdapter implements PanelAdapter {
   async getSslStatus(domain: string): Promise<SslInfo> {
     assertHostname(domain);
     if (this.client) {
-      const response = await this.client.request('GetSSLInfo', { domain }, { allowFailure: true });
-      if (response.status !== true) return { enabled: false, provider: 'none', domains: [] };
+      // GetSSL takes `siteName`, and its payload has no `endtime`/`ca`/`ishttps`
+      // fields — the real expiry is nested under `cert_data.notAfter` and the
+      // issuer under `cert_data.issuer_O`. An unknown site comes back with a
+      // non-zero status, which is how "no certificate" is distinguished from
+      // "certificate present".
+      const response = await this.client.requestOn<{
+        status?: boolean;
+        cert_data?: { notAfter?: string; issuer_O?: string; dns?: string[] };
+      }>('site', 'GetSSL', { siteName: domain }, { allowFailure: true });
+      if (!isSuccess(response.status)) return { enabled: false, provider: 'none', domains: [] };
+      const payload = response.message;
+      if (!payload?.status) return { enabled: false, provider: 'none', domains: [] };
+      const issuer = payload.cert_data?.issuer_O ?? '';
       return {
-        enabled: Boolean(response.status === true && (response.ishttps === 'y' || response.ishttps === true)),
-        provider: response.ca === 'letsencrypt' ? 'letsencrypt' : 'other',
-        expiry: typeof response.endtime === 'string' ? response.endtime : null,
-        domains: [],
+        enabled: true,
+        provider: issuer === "Let's Encrypt" ? 'letsencrypt' : 'other',
+        expiry: payload.cert_data?.notAfter ?? null,
+        domains: payload.cert_data?.dns ?? [],
       };
     }
     const certDir = `/www/server/panel/vhost/cert/${domain}`;
@@ -402,12 +501,13 @@ export class AaPanelAdapter implements PanelAdapter {
     }
 
     if (this.client) {
-      await this.client.request('SetSSL', {
+      // SetSSL wants `domain` and `domains`; `type` is "letsencrypt" and `force`
+      // is "y"/"n". Additional names go in `domains` as a comma-separated list.
+      await this.client.requestOn('site', 'SetSSL', {
         domain: input.domain,
+        domains: [input.domain, ...(input.altNames ?? [])].join(','),
         type: 'letsencrypt',
         force: input.force ? 'y' : 'n',
-        // aaPanel accepts additional domains as a JSON array string.
-        domains: JSON.stringify([input.domain, ...(input.altNames ?? [])]),
       });
     } else {
       await this.options.executor.exec(
@@ -429,17 +529,60 @@ export class AaPanelAdapter implements PanelAdapter {
     if (!website) return null;
     return {
       domain: website.domain,
-      documentRoot: website.documentRoot ?? website.root,
+      documentRoot: await this.documentRootOf(domain, website.root),
       phpVersion: website.phpVersion,
     };
+  }
+
+  /**
+   * The directory nginx actually serves.
+   *
+   * The site's `path` is only the webroot; the panel stores the serving
+   * directory separately as a run path relative to it. Reporting the webroot
+   * as the document root makes a correctly-configured site look misconfigured.
+   */
+  private async documentRootOf(domain: string, siteRoot: string): Promise<string> {
+    if (!this.client) return siteRoot;
+    const list = await this.siteListApi(domain);
+    const found = list.find((site) => site.name === domain);
+    if (!found) return siteRoot;
+    const response = await this.client.requestOn<{ runPath?: string }>(
+      'site',
+      'GetSiteRunPath',
+      { id: found.id },
+      { allowFailure: true },
+    );
+    const runPath = response.message?.runPath;
+    if (!isSuccess(response.status) || typeof runPath !== 'string' || runPath === '/' || runPath === '') {
+      return siteRoot;
+    }
+    return `${siteRoot.replace(/\/+$/, '')}${runPath.startsWith('/') ? runPath : `/${runPath}`}`;
   }
 
   async updateSiteConfig(config: SiteConfig): Promise<void> {
     assertHostname(config.domain);
     if (this.client) {
-      await this.client.request('SiteConfig', {
-        name: config.domain,
-        webroot: config.documentRoot,
+      const list = await this.siteListApi(config.domain);
+      const found = list.find((site) => site.name === config.domain);
+      if (!found) throw new PanelError(`Website "${config.domain}" not found; cannot set its document root.`);
+      // SetSiteRunPath takes a path RELATIVE to the site root (the panel
+      // concatenates it onto the site's own path), not an absolute one. There is
+      // no `SiteConfig` action on this panel version.
+      const siteRoot = found.path.replace(/\/+$/, '');
+      const documentRoot = config.documentRoot.replace(/\/+$/, '');
+      if (!documentRoot.startsWith(`${siteRoot}/`)) {
+        throw new PanelError(
+          `Document root ${documentRoot} is outside the site root ${siteRoot} for ${config.domain}.`,
+          {
+            remediation: [
+              `Set site.root to ${siteRoot} so the deploy layout lives inside the website directory.`,
+            ],
+          },
+        );
+      }
+      await this.client.requestOn('site', 'SetSiteRunPath', {
+        id: found.id,
+        runPath: documentRoot.slice(siteRoot.length),
       });
       return;
     }
@@ -469,10 +612,12 @@ export class AaPanelAdapter implements PanelAdapter {
 
   async setPhpVersion(domain: string, version: string): Promise<void> {
     if (this.client) {
-      const list = await this.siteListApi();
-      const found = list.find((site) => site.domain === domain);
+      const list = await this.siteListApi(domain);
+      const found = list.find((site) => site.name === domain);
       if (!found) throw new PanelError(`Website "${domain}" not found; cannot set PHP version.`);
-      await this.client.request('SetPHPVersion', { siteName: domain, phpVersion: version });
+      // SetPHPVersion reads `version`, not `phpVersion`; passing `phpVersion`
+      // leaves the version unset and the panel answers with an HTML 404.
+      await this.client.requestOn('site', 'SetPHPVersion', { siteName: domain, version, other: '' });
       return;
     }
     await this.options.executor.exec(
@@ -485,33 +630,82 @@ export class AaPanelAdapter implements PanelAdapter {
   // API list helpers
   // -------------------------------------------------------------------------
 
-  private async siteListApi(): Promise<ApiSite[]> {
-    const response = await this.requireClient().request<unknown>('GetSiteList', {});
-    // aaPanel returns either `data` (newer) or the list at the top level (older).
-    const raw = (Array.isArray(response) ? response : (response.data ?? response)) as unknown;
-    if (Array.isArray(raw)) return raw as ApiSite[];
-    if (Array.isArray((raw as { SITE?: unknown[] })?.SITE)) {
-      return (raw as { SITE: ApiSite[] }).SITE;
-    }
-    return [];
+  /**
+   * Sites known to the panel, read through the generic table endpoint.
+   *
+   * There is no `GetSiteList` action on this panel version; the listing that
+   * does exist, `/v2/site?action=get_site_list`, answers with an empty list for
+   * a site that the panel clearly has. `/v2/data?action=getData&table=sites`
+   * returns the real rows, which is what this reads.
+   */
+  private async siteListApi(search?: string): Promise<ApiSite[]> {
+    const response = await this.requireClient().requestOn<unknown>(
+      'data',
+      'getData',
+      getDataParams('sites', 200, search ?? ''),
+    );
+    return rowsOf(response).filter((row): row is ApiSite => isRecord(row) && typeof row.name === 'string');
   }
 
-  private async databaseListApi(): Promise<Array<{ id: number; name: string; username: string; host?: string; port?: number }>> {
-    const response = await this.requireClient().request<unknown>('GetDatabases', {});
-    const raw = (Array.isArray(response) ? response : (response.data ?? response)) as unknown;
-    if (Array.isArray(raw)) return raw as Array<{ id: number; name: string; username: string }>;
-    return [];
+  /**
+   * Databases registered with the panel.
+   *
+   * Reading this is what makes a database visible in aaPanel at all: a database
+   * created with raw SQL over SSH exists in MySQL but is absent from the
+   * panel's `databases` table, so it is unmanaged and invisible in the UI.
+   */
+  private async databaseListApi(search?: string): Promise<ApiDatabase[]> {
+    const response = await this.requireClient().requestOn<unknown>(
+      'data',
+      'getData',
+      getDataParams('databases', 200, search ?? ''),
+    );
+    return rowsOf(response).filter(
+      (row): row is ApiDatabase => isRecord(row) && typeof row.name === 'string',
+    );
   }
 }
 
-/** The site shape returned by the aaPanel API. */
+/** Unwrap the `message.data` rows that `/v2/data?action=getData` returns. */
+function rowsOf(response: AaPanelResponse<unknown>): unknown[] {
+  const message = response.message;
+  if (Array.isArray(message)) return message;
+  if (isRecord(message) && Array.isArray(message.data)) return message.data;
+  if (Array.isArray(response.data)) return response.data;
+  return [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * The site shape returned by `/v2/data?action=getData&table=sites`.
+ *
+ * Note the trap: the row's `domain` field is the *number* of domains bound to
+ * the site, not the domain itself. Reading it as the domain yields `domain: 1`
+ * and every hostname comparison fails, which looks like "the site does not
+ * exist" for a site that plainly does.
+ */
 interface ApiSite {
   id: number;
+  /** The primary domain. */
   name: string;
-  domain?: string;
+  /** Absolute webroot. */
   path: string;
+  /** e.g. "8.3". */
+  php_version?: string;
+}
+
+/** The database shape returned by the aaPanel API. */
+interface ApiDatabase {
+  id: number;
+  name: string;
+  username: string;
+  /** The access hosts aaPanel grants, e.g. "localhost". */
+  accept?: string;
+  host?: string;
   port?: number;
-  phpVersion?: string;
 }
 
 /**

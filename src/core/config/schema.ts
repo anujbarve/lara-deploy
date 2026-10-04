@@ -306,6 +306,11 @@ export const aapanelConfigSchema = z.object({
   timeoutMs: z.number().int().min(1000).default(30_000),
   /** SSL verification for the panel's self-signed certificate. */
   insecureTLS: z.boolean().default(false),
+  /**
+   * Host header to send. nginx rejects the panel with 403 unless the Host
+   * matches the panel's own hostname, even when connecting to its IP address.
+   */
+  hostHeader: z.string().min(1).optional(),
   /** Skip the panel API and drive panel behaviour over SSH instead. */
   fallbackToSsh: z.boolean().default(true),
   /** Force SSH mode even when an API key is present. */

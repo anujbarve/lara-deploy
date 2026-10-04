@@ -96,6 +96,9 @@ function happyServer(): FakeExecutor {
 }
 
 /** A panel adapter that reports "nothing exists yet" and records provisions. */
+/** Shared so a test can assert what the deploy stored. */
+const secrets = new MemorySecretsStore();
+
 function fakePanel(): PanelAdapter & { created: string[] } {
   const created: string[] = [];
   return {
@@ -175,7 +178,7 @@ function makeOrchestrator(configOverrides: Record<string, unknown> = {}, flagOve
     paths,
     config,
     profile,
-    secrets: new MemorySecretsStore(),
+    secrets,
     ui: new SilentUi(),
     clock: fixedClock('2026-10-03T10:32:10Z'),
     dryRun: false,
@@ -268,6 +271,19 @@ describe('deployment happy path', () => {
     // The credentials file is referenced, not inlined on the command line.
     expect(remote.saw('--defaults-file=')).toBe(true);
     expect(remote.saw('umask 077')).toBe(true);
+  });
+
+  it('runs artisan against the release being deployed, not the current symlink', async () => {
+    // On a first deploy `current` does not exist until activation, but artisan
+    // runs before that — so `cd current` failed and migrate could not run.
+    await makeOrchestrator().deploy(new AutoYes());
+    // Only real invocations: `cd <dir>` followed by `php artisan ...`.
+    const artisan = remote.commands.filter((c) => /^cd .*\n.*artisan /m.test(c));
+    expect(artisan.length).toBeGreaterThan(0);
+    for (const command of artisan) {
+      expect(command).toContain("/releases/20261003-103210'");
+      expect(command).not.toContain("cd '/www/wwwroot/example.com/current'");
+    }
   });
 
   it('forces production invariants over a development .env.example', async () => {
@@ -564,6 +580,45 @@ describe('infrastructure provisioning', () => {
 
     expect(result.success).toBe(true);
     expect(panel.created).toContain('website:example.com');
+  });
+
+  it('creates the database when it is missing', async () => {
+    // The deploy only printed "Database will be created" and created nothing,
+    // so it went on to dump a database that did not exist and died with
+    // "Access denied for user ...". The user did not exist either, because
+    // nothing had ever made it.
+    const panel = fakePanel();
+    const result = await makeOrchestrator({}, { panelFactory: () => panel }).deploy(new AutoYes());
+
+    expect(result.success).toBe(true);
+    // The fixture project's name is client-site, so the default database name
+    // is its slug.
+    expect(panel.created).toContain('database:client_site');
+  });
+
+  it('creates the database user with the password the deploy will use', async () => {
+    // Provisioning, the .env and the pre-migration backup must agree, or the
+    // backup authenticates with a password MySQL never accepted.
+    let passwordUsedForCreate: string | undefined;
+    const panel = fakePanel();
+    panel.createDatabase = async ({ name, password }) => {
+      passwordUsedForCreate = password;
+      panel.created.push(`database:${name}`);
+      return { name, username: name, host: 'localhost', port: 3306, accept: true };
+    };
+
+    await makeOrchestrator({}, { panelFactory: () => panel }).deploy(new AutoYes());
+
+    const stored = secrets.get('servers.test.database.password');
+    expect(stored).toBeTruthy();
+    expect(passwordUsedForCreate).toBe(stored);
+  });
+
+  it('reuses an existing database instead of creating a second', async () => {
+    const panel = fakePanel();
+    panel.databaseExists = async () => true;
+    await makeOrchestrator({}, { panelFactory: () => panel }).deploy(new AutoYes());
+    expect(panel.created.filter((c) => c.startsWith('database:'))).toHaveLength(0);
   });
 
   it('never provisions when --no-provision is set', async () => {

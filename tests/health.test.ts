@@ -7,7 +7,7 @@ import {
   healthChecksEnabled,
   type CheckResult,
 } from '../src/core/health/checker.js';
-import { healthCheckConfigSchema } from '../src/core/config/schema.js';
+import { healthCheckConfigSchema, queueConfigSchema, schedulerConfigSchema } from '../src/core/config/schema.js';
 import { buildLayout } from '../src/core/release/layout.js';
 import { verifySymlink, planStorageLayout, requiredReleasePaths } from '../src/laravel/storage.js';
 import { evaluateWorkers, parseSupervisorStatus } from '../src/laravel/workers.js';
@@ -278,6 +278,77 @@ describe('HealthChecker against a fake server', () => {
     const laravel = await checker.laravel();
     expect(laravel.status).toBe('fail');
     expect(laravel.message).toContain('APP_KEY');
+  });
+
+  it('skips queue and scheduler while no release is live yet', async () => {
+    // Workers and cron both run from the `current` symlink, which activation
+    // creates. This check gates activation, so on a first deploy they cannot
+    // be running yet — that is expected, and failing here blocked every
+    // first deploy.
+    const executor = new FakeExecutor().fail("test -d '/www/wwwroot/example.com/current'");
+    const checker = new HealthChecker({
+      executor,
+      layout,
+      config: healthCheckConfigSchema.parse({}),
+      domain: 'example.com',
+      phpBinary: 'php',
+      queue: queueConfigSchema.parse({ enabled: true }),
+      scheduler: schedulerConfigSchema.parse({ enabled: true, schedule: '* * * * *' }),
+    });
+
+    expect((await checker.queue()).status).toBe('skip');
+    expect((await checker.schedulerCheck()).status).toBe('skip');
+  });
+
+  it('skips the ssl probe when the project has ssl disabled', async () => {
+    // healthCheck.ssl defaults to true on its own, so a project that explicitly
+    // sets ssl.enabled: false still got an HTTPS probe that failed the deploy.
+    const executor = new FakeExecutor().fail('https://');
+    const checker = new HealthChecker({
+      executor,
+      layout,
+      config: healthCheckConfigSchema.parse({}),
+      domain: 'example.com',
+      phpBinary: 'php',
+      sslEnabled: false,
+    });
+
+    const report = await checker.runAll({ skipHttp: true });
+    expect(report.results.some((r) => r.name === 'ssl')).toBe(false);
+  });
+
+  it('still probes ssl when the project has it enabled', async () => {
+    const executor = new FakeExecutor().fail('probe-should-run');
+    const checker = new HealthChecker({
+      executor,
+      layout,
+      config: healthCheckConfigSchema.parse({}),
+      domain: 'example.com',
+      phpBinary: 'php',
+      sslEnabled: true,
+    });
+
+    const report = await checker.runAll({ skipHttp: true });
+    expect(report.results.some((r) => r.name === 'ssl')).toBe(true);
+  });
+
+  it('still checks queue and scheduler once a release is live', async () => {
+    const executor = new FakeExecutor()
+      .on('test -d', { exitCode: 0 })
+      .on('supervisorctl status', { stdout: 'laravel-app-worker  FATAL  Exited too quickly  0:00:00' });
+    const checker = new HealthChecker({
+      executor,
+      layout,
+      config: healthCheckConfigSchema.parse({}),
+      domain: 'example.com',
+      phpBinary: 'php',
+      queue: queueConfigSchema.parse({ enabled: true }),
+      scheduler: schedulerConfigSchema.parse({ enabled: true, schedule: '* * * * *' }),
+    });
+
+    // The live-release shortcut must not turn a genuinely dead worker into a
+    // skip.
+    expect((await checker.queue()).status).toBe('fail');
   });
 });
 

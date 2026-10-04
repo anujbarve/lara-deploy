@@ -61,6 +61,15 @@ export interface HealthCheckerOptions {
   appDir?: string;
   queue?: QueueConfig & { processName?: string };
   scheduler?: SchedulerConfig;
+  /**
+   * Whether SSL is configured for this project.
+   *
+   * `healthCheck.ssl` defaults to true on its own, so a project that
+   * explicitly sets `ssl.enabled: false` still got an HTTPS probe that failed
+   * the deploy — the check contradicted the config. Mirrors how queue and
+   * scheduler already gate on their enabled flags.
+   */
+  sslEnabled?: boolean;
   projectSlug?: string;
   clock?: Clock;
   fetchImpl?: typeof fetch;
@@ -174,7 +183,7 @@ export class HealthChecker {
     results.push(await this.laravel());
     if (config.database) results.push(await this.database());
     if (config.storage) results.push(await this.storage());
-    if (config.ssl) results.push(await this.ssl());
+    if (config.ssl && this.options.sslEnabled !== false) results.push(await this.ssl());
     if (config.queue && this.options.queue?.enabled) results.push(await this.queue());
     if (config.scheduler && this.options.scheduler?.enabled) results.push(await this.schedulerCheck());
 
@@ -367,10 +376,11 @@ export class HealthChecker {
       message: result.message,
       durationMs: Date.now() - started,
       remediation: expired
-        ? ['The certificate has expired: laravel-deploy ssl --force']
+        ? ['The certificate has expired — reissue it in aaPanel, then re-run the deploy.']
         : [
             'Check DNS resolves to this server: laravel-deploy domain check',
-            'Issue the certificate: laravel-deploy ssl',
+            'Issue the certificate in aaPanel ( Websites -> the site -> SSL ).',
+            'Or set "ssl": { "enabled": false } in .laravel-deploy.json if this site is HTTP-only for now.',
           ],
     };
   }
@@ -380,6 +390,18 @@ export class HealthChecker {
     const started = Date.now();
     const queue = this.options.queue;
     if (!queue?.enabled) return { name: 'queue', status: 'skip', message: 'queue disabled' };
+
+    // The workers run from the live `current` symlink, which does not exist
+    // until this release is activated — and this check gates activation. On a
+    // first deploy they cannot be running yet, which is expected, not a fault.
+    if (!(await this.hasLiveRelease())) {
+      return {
+        name: 'queue',
+        status: 'skip',
+        message: 'no live release yet; workers start once this one is activated',
+        durationMs: Date.now() - started,
+      };
+    }
 
     const manager = new SupervisorManager({ executor: this.executor });
     const names = queue.processName ? [queue.processName] : [this.defaultProgramName()];
@@ -403,6 +425,17 @@ export class HealthChecker {
     const started = Date.now();
     const scheduler = this.options.scheduler;
     if (!scheduler?.enabled) return { name: 'scheduler', status: 'skip', message: 'scheduler disabled' };
+
+    // Same reasoning as the queue check: the cron entry points at the live
+    // symlink, which only exists after activation.
+    if (!(await this.hasLiveRelease())) {
+      return {
+        name: 'scheduler',
+        status: 'skip',
+        message: 'no live release yet; the cron entry becomes live on activation',
+        durationMs: Date.now() - started,
+      };
+    }
 
     const cron = new CronManager(this.executor);
     const status = await cron.status({
@@ -461,6 +494,21 @@ export class HealthChecker {
   private defaultProgramName(): string {
     const slug = (this.options.projectSlug ?? 'app').toLowerCase().replace(/[^a-z0-9]+/g, '-');
     return `laravel-${slug || 'app'}-worker`;
+  }
+
+  /**
+   * True when the live release symlink resolves to a directory.
+   *
+   * Everything that runs from the live tree — queue workers, the scheduler —
+   * only works once a release has been activated. This distinguishes "not
+   * running" from "cannot be running yet", which is the normal state while
+   * the candidate release is still being vetted.
+   */
+  private async hasLiveRelease(): Promise<boolean> {
+    const result = await this.executor.exec(`test -d ${q(this.options.layout.appDir)}`, {
+      allowFailure: true,
+    });
+    return result.exitCode === 0;
   }
 }
 

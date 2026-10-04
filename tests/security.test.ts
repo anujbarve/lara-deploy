@@ -608,7 +608,8 @@ describe('supervisor program name safety', () => {
     const manager = new SupervisorManager({ executor });
     await manager.restart(['laravel-app-worker', 'laravel-app-worker-1']);
 
-    const command = executor.commands[0] as string;
+    // Not commands[0]: locating supervisorctl runs first, so find the restart.
+    const command = executor.commands.find((c) => c.includes(' restart ')) as string;
     expect(command).toContain(shellQuote('laravel-app-worker'));
     expect(command).not.toMatch(/restart [a-z]/);
   });

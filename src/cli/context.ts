@@ -146,7 +146,17 @@ export async function createContext(options: GlobalOptions, command?: Command): 
     },
 
     panel(executor: RemoteExecutor): AaPanelAdapter {
-      return new AaPanelAdapter({ profile, config: profile.aapanel, executor, logger });
+      // The panel key is kept in the secrets store rather than config.json, so
+      // it has to be read back here — without this the adapter saw no key and
+      // every command silently fell back to SSH.
+      const storedKey = secrets.get(`servers.${profile.name}.aapanel.apiKey`);
+      const apiKey = storedKey ?? profile.aapanel.apiKey;
+      return new AaPanelAdapter({
+        profile,
+        config: { ...profile.aapanel, ...(apiKey ? { apiKey } : {}) },
+        executor,
+        logger,
+      });
     },
     web: (executor) => new WebServerProvider(executor),
     supervisor: (executor) => new SupervisorManager({ executor }),

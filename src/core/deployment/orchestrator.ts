@@ -220,7 +220,10 @@ export class DeploymentOrchestrator {
       // -- 11: build plan ----------------------------------------------------
       const buildStagePlan = planBuild(this.project, config);
       const artisanFactory = new ArtisanCommandFactory(this.project, {
-        releasePath: this.layout.appDir,
+        // The concrete release, not `current/`: artisan commands run before
+        // activation, and on a first deploy `current` does not exist yet, so
+        // `cd current` failed and migrate could not run at all.
+        releasePath: this.releaseDirectory(),
         phpBinary: this.phpBinary(),
       });
       const cachePlan = planCaches(artisanFactory);
@@ -518,11 +521,22 @@ export class DeploymentOrchestrator {
       // --no-provision means "discover only": existence checks still work.
       config: {
         ...this.options.profile.aapanel,
+        // The panel key lives in the secrets store, not in config.json. It was
+        // never read, so `laravel-deploy secrets set ...aapanel.apiKey` had no
+        // effect and the panel API stayed unusable.
+        ...this.resolvedPanelApiKey(),
         enabled: this.options.noProvision ? false : this.options.profile.aapanel.enabled,
       },
       executor,
       logger: this.logger,
     });
+  }
+
+  /** The panel API key from the secrets store, if one is set. */
+  private resolvedPanelApiKey(): { apiKey?: string } {
+    const stored = this.options.secrets.get(`servers.${this.options.profile.name}.aapanel.apiKey`);
+    const apiKey = stored ?? this.options.profile.aapanel.apiKey;
+    return apiKey ? { apiKey } : {};
   }
 
   private async discoverInfrastructure(
@@ -591,7 +605,25 @@ export class DeploymentOrchestrator {
       const dbName = config.database.name ?? slugify(this.project.name);
       if (config.database.createIfMissing) {
         const existing = await panel.databaseExists(dbName);
-        ui.status(existing ? 'Database exists' : 'Database will be created', dbName);
+        if (existing) {
+          ui.status('Database exists', dbName);
+        } else {
+          // This used to only print "Database will be created" and never create
+          // anything, so the deploy went on to dump a database that did not
+          // exist and died with "Access denied" — the user does not exist
+          // either, because nothing had made it. Create it now, with the same
+          // password the .env and the pre-migration backup will use.
+          const dbUser = config.database.username ?? dbName;
+          const password = this.resolveDatabasePassword();
+          const created = await ensureDatabase(panel, {
+            name: dbName,
+            username: dbUser,
+            password,
+            ...(config.database.host ? { host: config.database.host } : {}),
+          });
+          if (created.created) ui.action('Created database', dbName);
+          else ui.status('Database exists', dbName);
+        }
       }
     }
 
@@ -920,12 +952,27 @@ export class DeploymentOrchestrator {
     void envValidation;
   }
 
+  /**
+   * The password for the application's database user, generated and persisted on
+   * first use. Provisioning, the .env and the pre-migration backup must all
+   * agree, so they share this rather than each calling generatePassword().
+   */
+  private resolveDatabasePassword(): string {
+    const key = `servers.${this.options.profile.name}.database.password`;
+    const existing = this.options.secrets.get(key);
+    if (existing) return existing;
+    const generated = generatePassword();
+    this.options.secrets.set(key, generated);
+    this.logger.info('Generated and stored a database password.');
+    return generated;
+  }
+
   private async writeRemoteEnv(executor: RemoteExecutor, config: AppConfig): Promise<void> {
-    const { ui, secrets } = this.options;
+    const { ui } = this.options;
     const current = await this.readRemoteEnv(executor);
     const dbName = config.database.name ?? slugify(this.project.name);
     const dbUser = config.database.username ?? dbName;
-    const dbPassword = secrets.get(`servers.${this.options.profile.name}.database.password`) ?? generatePassword();
+    const dbPassword = this.resolveDatabasePassword();
 
     const templateContents = config.env.templatePath
       ? await this.readLocalFile(config.env.templatePath)
@@ -967,11 +1014,8 @@ export class DeploymentOrchestrator {
     });
     ui.status('Server .env written', `${plan.changedKeys.length} variable(s) changed: ${plan.changedKeys.join(', ') || 'none'}`);
 
-    // Persist the generated DB password so future deploys reuse it.
-    if (!secrets.get(`servers.${this.options.profile.name}.database.password`)) {
-      secrets.set(`servers.${this.options.profile.name}.database.password`, dbPassword);
-      this.logger.info('Generated and stored a database password.');
-    }
+    // The password was already generated and stored by resolveDatabasePassword()
+    // before provisioning, so the server .env and the MySQL user cannot drift.
   }
 
   private async readRemoteEnv(executor: RemoteExecutor): Promise<string | null> {
@@ -983,10 +1027,10 @@ export class DeploymentOrchestrator {
   }
 
   private async backupDatabase(executor: RemoteExecutor, config: AppConfig): Promise<string> {
-    const { ui, clock, secrets } = this.options;
+    const { ui, clock } = this.options;
     const dbName = config.database.name ?? slugify(this.project.name);
     const dbUser = config.database.username ?? dbName;
-    const password = secrets.get(`servers.${this.options.profile.name}.database.password`) ?? '';
+    const password = this.resolveDatabasePassword();
 
     const mysql = new MysqlProvider({ executor, logger: this.logger });
     ui.startSpinner(`Backing up ${dbName}`);
@@ -1018,14 +1062,14 @@ export class DeploymentOrchestrator {
   ): Promise<number | null> {
     if (!config.deployment.migrations) return null;
     const factory = new ArtisanCommandFactory(this.project, {
-      releasePath: this.layout.appDir,
+      releasePath: this.releaseDirectory(),
       phpBinary: this.phpBinary(),
     });
     const invocation = factory.status();
     const result = await executor.exec(
       [
         'set -Eeuo pipefail',
-        `cd ${q(invocation.cwd ?? this.layout.appDir)}`,
+        `cd ${q(invocation.cwd ?? this.releaseDirectory())}`,
         `${q(this.phpBinary())} artisan ${invocation.args.join(' ')}`,
       ].join('\n'),
       { allowFailure: true, timeoutMs: config.timeouts.artisan, label: 'migrate:status' },
@@ -1058,7 +1102,9 @@ export class DeploymentOrchestrator {
     label: string,
   ): Promise<void> {
     const { config, ui } = this.options;
-    const cwd = invocation.cwd ?? this.layout.appDir;
+    // Default to the release being deployed, not the live symlink: artisan
+    // runs before activation, so `current` does not exist on a first deploy.
+    const cwd = invocation.cwd ?? this.releaseDirectory();
     const command = renderCommand(invocation.args, this.phpBinary());
     ui.command(command, label);
 
@@ -1137,7 +1183,7 @@ export class DeploymentOrchestrator {
     // Graceful restart first: queue:restart asks workers to exit after the
     // current job, which is safer than SIGKILL.
     const factory = new ArtisanCommandFactory(this.project, {
-      releasePath: this.layout.appDir,
+      releasePath: this.releaseDirectory(),
       phpBinary: this.phpBinary(),
     });
     try {
@@ -1171,6 +1217,7 @@ export class DeploymentOrchestrator {
       appDir: this.releaseDirectory(),
       queue: config.queue,
       scheduler: config.scheduler,
+      sslEnabled: config.ssl.enabled,
       projectSlug: slugify(this.project.name),
       clock: this.options.clock,
     });
@@ -1188,6 +1235,7 @@ export class DeploymentOrchestrator {
       phpBinary: this.phpBinary(),
       queue: config.queue,
       scheduler: config.scheduler,
+      sslEnabled: config.ssl.enabled,
       projectSlug: slugify(this.project.name),
       clock: this.options.clock,
     });
