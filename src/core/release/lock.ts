@@ -58,6 +58,40 @@ export class DeploymentLock {
   }
 
   /**
+   * The shell script that takes the lock. Extracted so its semantics can be
+   * asserted directly, since the difference between "contended" and "broken"
+   * lives entirely in this text.
+   */
+  buildAcquireScript(lockFile: string, info: Omit<AcquireLockOptions, 'lockFile' | 'force' | 'staleAfterMs'>): string {
+    const payload = JSON.stringify({ ...info, pid: process.pid }, null, 2);
+    const tag = `LDLOCK${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    // The .deploy directory does not exist on a first deploy, and a bare
+    // `mkdir` of the lock directory would then fail with ENOENT — which the
+    // race check below reads as "someone else holds the lock". Skipped when the
+    // lock path has no directory component, since `mkdir -p ''` would abort
+    // the whole script under `set -e`.
+    const lockDir = lockFile.replace(/\/[^/]*$/, '');
+    return [
+      'set -Eeuo pipefail',
+      ...(lockDir === '' ? [] : [`mkdir -p ${q(lockDir)}`]),
+      `lockdir=${q(lockFile)}.d`,
+      // mkdir is atomic: exactly one deploy wins the race. A failure is only
+      // contention when the directory now exists; anything else (permissions,
+      // read-only filesystem) is a real error and must not be reported as
+      // "another deployment is running".
+      `if ! mkdir "$lockdir" 2>/dev/null; then`,
+      '  if [ -d "$lockdir" ]; then echo "LOCKED"; exit 3; fi',
+      `  echo "unable to create lock directory $lockdir" >&2`,
+      '  exit 4',
+      'fi',
+      `cat > ${q(lockFile)} <<'${tag}'`,
+      payload,
+      `${tag}`,
+      `chmod 0600 ${q(lockFile)}`,
+    ].join('\n');
+  }
+
+  /**
    * Acquire the lock. Uses a single atomic mkdir so two deploys cannot both win.
    */
   async acquire(options: AcquireLockOptions): Promise<LockInfo> {
@@ -79,34 +113,30 @@ export class DeploymentLock {
       await this.release(options.lockFile);
     }
 
-    const payload = JSON.stringify(
-      {
-        deploymentId: options.deploymentId,
-        startedAt: options.startedAt,
-        host: options.host,
-        user: options.user,
-        pid: process.pid,
-      },
-      null,
-      2,
-    );
+    const script = this.buildAcquireScript(options.lockFile, {
+      deploymentId: options.deploymentId,
+      startedAt: options.startedAt,
+      host: options.host,
+      user: options.user,
+    });
 
-    const tag = `LDLOCK${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
-    const script = [
-      'set -Eeuo pipefail',
-      `lockdir=${q(options.lockFile)}.d`,
-      // mkdir is atomic: exactly one deploy wins the race.
-      `if ! mkdir "$lockdir" 2>/dev/null; then echo "LOCKED"; exit 3; fi`,
-      `cat > ${q(options.lockFile)} <<'${tag}'`,
-      payload,
-      `${tag}`,
-      `chmod 0600 ${q(options.lockFile)}`,
-    ].join('\n');
-
-    const result = await this.executor.exec(script, { label: 'acquire deployment lock' });
+    // allowFailure so exit codes 3 and 4 are inspected here rather than thrown
+    // as a generic remote failure by the executor.
+    const result = await this.executor.exec(script, {
+      label: 'acquire deployment lock',
+      allowFailure: true,
+    });
     if (result.exitCode === 3) {
       throw new DeploymentLockedError('Another deployment acquired the lock first.', {
         remediation: ['Wait for it to complete, or re-run with --force-unlock.'],
+      });
+    }
+    if (result.exitCode === 4) {
+      throw new DeploymentLockedError(`Unable to create the lock directory for ${options.lockFile}.`, {
+        details: { stderr: result.stderr.slice(-1000) },
+        remediation: [
+          `Check that the SSH user can write to the directory holding ${options.lockFile}.`,
+        ],
       });
     }
     if (result.exitCode !== 0) {

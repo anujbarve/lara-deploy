@@ -55,7 +55,13 @@ export function globalConfigDir(env: NodeJS.ProcessEnv = process.env): string {
  * On Windows that directory is no longer where new state is written, but an
  * existing one is copied across on first run rather than left to rot.
  */
-export function legacyGlobalConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+export function legacyGlobalConfigDir(env: NodeJS.ProcessEnv = process.env): string | null {
+  // An explicit override means "use exactly this directory". Treating the
+  // historical location as a migration source there would copy the real
+  // ~/.config/laravel-deploy — config, secrets and state — into whatever
+  // directory the caller pointed at, which is never what an override intends.
+  const override = envValue(env, 'LARAVEL_DEPLOY_CONFIG_DIR');
+  if (override && override.trim() !== '') return null;
   const xdg = envValue(env, 'XDG_CONFIG_HOME');
   if (xdg && xdg.trim() !== '') return path.join(xdg, GLOBAL_CONFIG_DIRNAME);
   return path.join(os.homedir(), '.config', GLOBAL_CONFIG_DIRNAME);
@@ -70,7 +76,8 @@ const MIGRATED_FILES = ['config.json', 'secrets.json', 'state'] as const;
  * Split out from `migrateLegacyConfigDir` so the copy semantics can be tested
  * directly. Returns the names of the entries that were copied.
  */
-export function copyConfigDir(from: string, to: string): string[] {
+export function copyConfigDir(from: string | null, to: string): string[] {
+  if (from === null) return [];
   if (path.resolve(from) === path.resolve(to)) return [];
 
   const copied: string[] = [];

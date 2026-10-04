@@ -17,6 +17,7 @@ import { planPermissions } from '../src/providers/webserver/provider.js';
 import { StorageSecretsStore } from '../src/core/security/storage-store.js';
 import { MemorySecretsStore } from '../src/core/security/secrets.js';
 import { FakeExecutor } from './helpers.js';
+import type { ExecOptions, ExecResult } from '../src/providers/exec/types.js';
 import { SupervisorManager } from '../src/providers/supervisor/manager.js';
 import { validateAppConfig } from '../src/core/config/loader.js';
 import { q as shellQuote } from '../src/utils/shell.js';
@@ -340,6 +341,88 @@ describe('deployment lock', () => {
     expect(executor.saw('mkdir')).toBe(true);
     expect(executor.saw('DEPLOY-1')).toBe(true);
     expect(executor.saw('chmod 0600')).toBe(true);
+  });
+
+  it('creates the .deploy directory before the atomic lock mkdir', async () => {
+    // On a first deploy <root>/.deploy does not exist yet, and a bare `mkdir`
+    // of the lock directory would fail with ENOENT — indistinguishable from
+    // the lock being held.
+    const executor = new FakeExecutor();
+    const lock = new DeploymentLock(executor);
+    await lock.acquire({
+      lockFile: '/www/wwwroot/example.com/.deploy/deployment.lock',
+      deploymentId: 'DEPLOY-1',
+      startedAt: new Date().toISOString(),
+      host: 'laptop',
+      user: 'root',
+    });
+    const script = executor.commands[executor.commands.length - 1] as string;
+    expect(script).toContain("mkdir -p '/www/wwwroot/example.com/.deploy'");
+    expect(script.indexOf('mkdir -p')).toBeLessThan(script.indexOf('lockdir='));
+  });
+
+  it('reports exit code 3 as a locked error, not a generic remote failure', async () => {
+    // The lock script exits 3 when it loses the race; the executor must be
+    // allowed to return that code so acquire() can translate it.
+    const executor = new FakeExecutor();
+    let sawAllowFailure: boolean | undefined;
+    executor.on('mkdir "$lockdir"', { exitCode: 3, stdout: 'LOCKED' });
+    const original = executor.exec.bind(executor);
+    executor.exec = async (command: string, options?: ExecOptions): Promise<ExecResult> => {
+      if (command.includes('LDLOCK')) sawAllowFailure = options?.allowFailure;
+      return original(command, options);
+    };
+
+    await expect(
+      new DeploymentLock(executor).acquire({
+        lockFile: '/www/wwwroot/example.com/.deploy/deployment.lock',
+        deploymentId: 'DEPLOY-1',
+        startedAt: new Date().toISOString(),
+        host: 'laptop',
+        user: 'root',
+      }),
+    ).rejects.toThrow(/Another deployment acquired the lock first/);
+    expect(sawAllowFailure).toBe(true);
+  });
+
+  it('does not report a permission failure as lock contention', async () => {
+    // A mkdir that fails for any reason other than the directory existing means
+    // something is wrong with the server, not that a deploy is running.
+    const script = await new DeploymentLock(new FakeExecutor()).buildAcquireScript(
+      '/www/wwwroot/example.com/.deploy/deployment.lock',
+      { deploymentId: 'DEPLOY-1', startedAt: '2026-10-03 10:32:10', host: 'laptop', user: 'root' },
+    );
+    expect(script).toContain('if [ -d "$lockdir" ]; then echo "LOCKED"; exit 3; fi');
+    expect(script).toContain('exit 4');
+  });
+
+  it('reports exit code 4 as a lock-directory problem, not contention', async () => {
+    const executor = new FakeExecutor().on('mkdir "$lockdir"', { exitCode: 4, stderr: 'Permission denied' });
+    await expect(
+      new DeploymentLock(executor).acquire({
+        lockFile: '/www/wwwroot/example.com/.deploy/deployment.lock',
+        deploymentId: 'DEPLOY-1',
+        startedAt: new Date().toISOString(),
+        host: 'laptop',
+        user: 'root',
+      }),
+    ).rejects.toThrow(/Unable to create the lock directory/);
+  });
+
+  it('omits the parent mkdir when the lock path has no directory', async () => {
+    // `mkdir -p ''` exits non-zero and, under `set -e`, would abort the whole
+    // acquire script rather than reporting a lock problem.
+    const executor = new FakeExecutor();
+    await new DeploymentLock(executor).acquire({
+      lockFile: '/deployment.lock',
+      deploymentId: 'DEPLOY-1',
+      startedAt: new Date().toISOString(),
+      host: 'laptop',
+      user: 'root',
+    });
+    const script = executor.commands[executor.commands.length - 1] as string;
+    expect(script).not.toContain('mkdir -p');
+    expect(script).toContain("lockdir='/deployment.lock'.d");
   });
 
   it('refuses to deploy while another lock is held', async () => {

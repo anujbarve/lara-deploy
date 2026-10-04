@@ -233,6 +233,30 @@ describe('migrateLegacyConfigDir', () => {
   it('does not migrate anything when there is nothing to migrate', () => {
     expect(migrateLegacyConfigDir({ LARAVEL_DEPLOY_CONFIG_DIR: tempDir() })).toEqual([]);
   });
+
+  it('never copies the real config into an explicit override', () => {
+    // An explicit LARAVEL_DEPLOY_CONFIG_DIR is a deliberate "use exactly this".
+    // Treating ~/.config/laravel-deploy as a migration source would silently
+    // copy the user's real config, secrets and state into it.
+    const home = tempDir();
+    const legacy = path.join(home, '.config', 'laravel-deploy');
+    fs.mkdirSync(legacy, { recursive: true });
+    fs.writeFileSync(path.join(legacy, 'config.json'), '{"version":1,"servers":{}}\n');
+    fs.writeFileSync(path.join(legacy, 'secrets.json'), '{"version":1,"encrypted":false,"entries":{}}\n');
+
+    const originalHome = os.homedir;
+    Object.defineProperty(os, 'homedir', { value: () => home, configurable: true });
+    try {
+      const target = tempDir();
+      const env = { LARAVEL_DEPLOY_CONFIG_DIR: target };
+      expect(legacyGlobalConfigDir(env)).toBeNull();
+      expect(migrateLegacyConfigDir(env)).toEqual([]);
+      // The override directory was left completely untouched.
+      expect(fs.readdirSync(target)).toEqual([]);
+    } finally {
+      Object.defineProperty(os, 'homedir', { value: originalHome, configurable: true });
+    }
+  });
 });
 
 describe('copyConfigDir', () => {

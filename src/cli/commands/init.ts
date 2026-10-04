@@ -25,7 +25,12 @@ export function registerInitCommand(program: Command): void {
   program
     .command('init')
     .description('Create a deployment configuration interactively')
-    .option('--env <environment>', 'write .laravel-deploy.<environment>.json instead', 'production')
+    // No default: the plain `.laravel-deploy.json` is the file every other
+    // command discovers. Defaulting to `production` here wrote
+    // `.laravel-deploy.production.json`, which nothing reads unless `--env
+    // production` is passed explicitly, so the very next command reported
+    // that no configuration existed.
+    .option('--env <environment>', 'write .laravel-deploy.<environment>.json instead')
     .option('--force', 'overwrite an existing configuration file')
     .option('--json', 'machine-readable output')
     .option('--cwd <path>', 'project directory')
@@ -34,16 +39,19 @@ export function registerInitCommand(program: Command): void {
       await runCommand(async () => {
         const ui = new TerminalUi({ color: process.env.NO_COLOR === undefined });
         const cwd = flags.cwd ?? process.cwd();
-        const target = path.join(cwd, `.laravel-deploy.${flags.env ?? 'production'}.json`);
+        const target = flags.env
+          ? path.join(cwd, `.laravel-deploy.${flags.env}.json`)
+          : path.join(cwd, PROJECT_CONFIG_BASENAME);
 
-        const existing = path.join(cwd, PROJECT_CONFIG_BASENAME);
-        if (fs.existsSync(existing) && !flags.force) {
+        // Guard the file actually being written, not the base name: with
+        // `--env staging` the target is the staging file.
+        if (fs.existsSync(target) && !flags.force) {
           const overwrite = await confirm({
-            message: `${PROJECT_CONFIG_BASENAME} already exists. Overwrite?`,
+            message: `${path.basename(target)} already exists. Overwrite?`,
             default: false,
           });
           if (!overwrite) {
-            ui.warn('Cancelled.', `${PROJECT_CONFIG_BASENAME} was left untouched.`);
+            ui.warn('Cancelled.', `${path.basename(target)} was left untouched.`);
             return 1;
           }
         }

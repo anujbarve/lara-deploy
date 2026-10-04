@@ -146,6 +146,20 @@ describe('config file parsing', () => {
     expect(production.config.deployment.keepReleases).toBe(3);
   });
 
+  it('discovers the file init writes by default', () => {
+    // Regression: init used to default --env to production and write
+    // .laravel-deploy.production.json, which loadProjectConfig never finds
+    // without an explicit --env, so deploy immediately claimed no config.
+    const root = makeLaravelFixture();
+    created.push(root);
+    const written = path.join(root, '.laravel-deploy.json');
+    fs.writeFileSync(written, JSON.stringify({ server: 'prod', site: { domain: 'example.com' } }));
+
+    const loaded = loadProjectConfig({ cwd: root, required: true });
+    expect(loaded.config.site.domain).toBe('example.com');
+    expect(loaded.sources).toEqual([written]);
+  });
+
   it('throws an actionable error when no config exists', () => {
     const root = makeLaravelFixture();
     created.push(root);

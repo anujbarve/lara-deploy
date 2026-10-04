@@ -26,7 +26,7 @@ import {
 import { serverProfileSchema } from '../src/core/config/schema.js';
 import { TransportError } from '../src/core/errors/errors.js';
 import { SshExecutor } from '../src/providers/exec/ssh.js';
-import { SftpUploader } from '../src/providers/sftp/uploader.js';
+import { SftpUploader, resolveSftpClientConstructor } from '../src/providers/sftp/uploader.js';
 
 const created: string[] = [];
 afterEach(() => {
@@ -317,5 +317,81 @@ describe('host verifier reaches the connection', () => {
     expect(verifier?.(Buffer.from(KEY, 'base64'))).toBe(true);
     expect(verifier?.(Buffer.from(OTHER, 'base64'))).toBe(false);
     await uploader.close();
+  });
+});
+
+describe('SFTP client construction', () => {
+  const profile = serverProfileSchema.parse({
+    name: 'test',
+    host: '10.0.0.1',
+    username: 'root',
+    siteRoot: '/www/wwwroot',
+  });
+
+  it('builds a real client when none is injected', () => {
+    // Every other test injects a clientFactory, which is why the real
+    // construction path shipped broken: ssh2-sftp-client does
+    // `module.exports = SftpClient`, so destructuring { SftpClient } from the
+    // default import is undefined and every upload threw
+    // "SftpClient is not a constructor".
+    expect(() => new SftpUploader({ profile })).not.toThrow();
+  });
+
+  it('resolves the constructor from every shape the dependency uses', () => {
+    class Full {
+      connect(): Promise<string> {
+        return Promise.resolve('');
+      }
+      end(): Promise<void> {
+        return Promise.resolve();
+      }
+      fastPut(): Promise<string> {
+        return Promise.resolve('');
+      }
+      put(): Promise<string> {
+        return Promise.resolve('');
+      }
+      mkdir(): Promise<string> {
+        return Promise.resolve('');
+      }
+      // The real client spells this `delete`; `unlink` never existed.
+      delete(): Promise<string> {
+        return Promise.resolve('');
+      }
+      stat(): Promise<{ size: number }> {
+        return Promise.resolve({ size: 0 });
+      }
+    }
+    expect(resolveSftpClientConstructor(Full)).toBe(Full);
+    expect(resolveSftpClientConstructor({ SftpClient: Full })).toBe(Full);
+    expect(resolveSftpClientConstructor({ default: { SftpClient: Full } })).toBe(Full);
+    expect(resolveSftpClientConstructor({ default: Full })).toBe(Full);
+  });
+
+  it('rejects a client missing methods the uploader calls', () => {
+    // A hand-written interface compiles happily against a method the real
+    // client lacks, which is how `unlink` shipped and its TypeError was
+    // swallowed, leaving stale archives on the server forever.
+    class Partial {
+      connect(): Promise<string> {
+        return Promise.resolve('');
+      }
+    }
+    expect(() => resolveSftpClientConstructor(Partial)).toThrow(/missing required methods/);
+    try {
+      resolveSftpClientConstructor(Partial);
+    } catch (error) {
+      expect((error as TransportError).message).toContain('delete');
+      expect((error as TransportError).remediation.join(' ')).toContain('npm install');
+    }
+  });
+
+  it('fails with actionable advice when no constructor is present', () => {
+    expect(() => resolveSftpClientConstructor({})).toThrow(/Could not load the SFTP client/);
+    try {
+      resolveSftpClientConstructor({});
+    } catch (error) {
+      expect((error as TransportError).remediation.join(' ')).toContain('npm install');
+    }
   });
 });

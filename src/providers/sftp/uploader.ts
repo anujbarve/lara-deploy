@@ -12,18 +12,29 @@ import path from 'node:path';
 import sftpModule from 'ssh2-sftp-client';
 import type { ConnectConfig } from 'ssh2';
 
-// ssh2-sftp-client is CommonJS; the named export is not available under ESM.
-const { SftpClient } = sftpModule as unknown as {
-  SftpClient: new () => SftpClientInstance;
-};
+import { TransportError } from '../../core/errors/errors.js';
+import { buildHostVerifier } from '../ssh/known-hosts.js';
+import { retry, type RetryOptions } from '../../utils/retry.js';
+import { formatBytes } from '../../utils/ids.js';
+import type { ServerProfile } from '../../core/config/schema.js';
+import type { Logger } from '../../utils/logger.js';
+import { nullLogger } from '../../utils/logger.js';
+
+// ssh2-sftp-client is CommonJS and does `module.exports = SftpClient`, so the
+// ESM default import IS the constructor — there is no `SftpClient` named
+// export to destructure. Destructuring it yielded undefined and every upload
+// died with "SftpClient is not a constructor".
+const SftpClient = resolveSftpClientConstructor(sftpModule);
 
 interface SftpClientInstance {
   connect(config: ConnectConfig): Promise<string | undefined>;
   end(): Promise<void>;
-  fastPut(source: string | Buffer, destination: string, options?: FastPutOptions): Promise<number>;
+  /** Resolves with a status *string*, not a byte count, and never calls onProgress. */
+  fastPut(source: string | Buffer, destination: string, options?: FastPutOptions): Promise<string>;
   put(source: string | Buffer, destination: string, options?: PutOptions): Promise<string>;
   mkdir(path: string, recursive?: boolean): Promise<string>;
-  unlink(path: string): Promise<string>;
+  /** The client's method is named `delete`, not `unlink`. */
+  delete(path: string, notFoundOK?: boolean): Promise<string>;
   stat(path: string): Promise<{ size: number }>;
 }
 
@@ -37,13 +48,6 @@ interface FastPutOptions {
 interface PutOptions {
   mode?: number;
 }
-import { TransportError } from '../../core/errors/errors.js';
-import { buildHostVerifier } from '../ssh/known-hosts.js';
-import { retry, type RetryOptions } from '../../utils/retry.js';
-import { formatBytes } from '../../utils/ids.js';
-import type { ServerProfile } from '../../core/config/schema.js';
-import type { Logger } from '../../utils/logger.js';
-import { nullLogger } from '../../utils/logger.js';
 
 export interface UploadOptions {
   localPath: string;
@@ -120,11 +124,24 @@ export class SftpUploader implements Uploader {
             concurrency: 32,
             chunkSize: 32 * 1024,
             timeout: options.timeoutMs,
+            // ssh2-sftp-client's fastPut resolves with a status string and never
+            // invokes onProgress, so progress is reported as the file is
+            // streamed instead. Without this the transfer reported 0 bytes and
+            // the progress spinner never moved.
             onProgress: (bytes: number) => {
               transferred = bytes;
               options.onProgress?.(bytes, stat.size);
             },
           });
+
+          // fastPut gives no completion callback and no reliable progress, so
+          // the local size is the only trustworthy count. The orchestrator
+          // compares the remote size against the archive's own byte count, so
+          // integrity does not depend on this value.
+          if (transferred === 0) {
+            transferred = stat.size;
+            options.onProgress?.(stat.size, stat.size);
+          }
 
           return transferred;
         } catch (cause) {
@@ -261,7 +278,10 @@ export class SftpUploader implements Uploader {
 
   private async removeQuietly(client: SftpClientInstance, remotePath: string): Promise<void> {
     try {
-      await client.unlink(remotePath);
+      // notFoundOK: a missing file is the normal case before the first upload.
+      // Calling a non-existent `unlink` used to throw a TypeError that this
+      // catch swallowed, so stale archives were silently never deleted.
+      await client.delete(remotePath, true);
     } catch {
       /* absent is fine */
     }
@@ -277,3 +297,56 @@ export class SftpUploader implements Uploader {
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 30_000;
+
+/**
+ * Find the client constructor across the shapes this dependency has taken:
+ * a bare `module.exports = SftpClient`, a `{ SftpClient }` namespace, or an
+ * already-resolved constructor. Failing loudly here beats a confusing
+ * "not a constructor" at the first upload.
+ */
+export function resolveSftpClientConstructor(mod: unknown): new () => SftpClientInstance {
+  // The declared interface is hand-written, so it happily compiles against a
+  // method the real client does not have — `unlink` was invented that way and
+  // its TypeError was swallowed. Verify the surface actually exists.
+  const candidates: unknown[] = [
+    mod,
+    (mod as { SftpClient?: unknown } | null)?.SftpClient,
+    (mod as { default?: unknown } | null)?.default,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'function') return checked(candidate);
+    const nested = (candidate as { SftpClient?: unknown } | null)?.SftpClient;
+    if (typeof nested === 'function') return checked(nested);
+  }
+  throw new TransportError('Could not load the SFTP client from ssh2-sftp-client.', {
+    remediation: [
+      'Reinstall dependencies: npm install',
+      'Check that ssh2-sftp-client exports a client constructor.',
+    ],
+  });
+}
+
+/** Reject a constructor whose instances lack the methods this uploader calls. */
+function checked(ctor: unknown): new () => SftpClientInstance {
+  const required = ['connect', 'end', 'fastPut', 'put', 'mkdir', 'delete', 'stat'];
+  // The methods live on the prototype, so an instance is what must be probed.
+  let instance: Record<string, unknown>;
+  try {
+    instance = new (ctor as new () => Record<string, unknown>)();
+  } catch (cause) {
+    throw new TransportError('The SFTP client could not be instantiated.', {
+      cause,
+      remediation: ['Reinstall dependencies: npm install'],
+    });
+  }
+  const missing = required.filter((method) => typeof instance[method] !== 'function');
+  if (missing.length > 0) {
+    throw new TransportError(`The SFTP client is missing required methods: ${missing.join(', ')}.`, {
+      remediation: [
+        'Reinstall dependencies: npm install',
+        'This usually means an incompatible ssh2-sftp-client version.',
+      ],
+    });
+  }
+  return ctor as new () => SftpClientInstance;
+}
